@@ -353,7 +353,7 @@ export default function CreateRoomPage({
 
 // ─── Mini Grid Preview ────────────────────────────────────────────────────────
 
-function MiniGrid({ n, active }: { n: number active: boolean }) {
+function MiniGrid({ n, active }: { n: number, active: boolean }) {
   const G = 10
   const size = (n + 1) * G
   const color = active ? "#4f8ef7" : "rgba(255,255,255,0.35)"

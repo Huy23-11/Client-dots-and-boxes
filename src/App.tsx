@@ -16,6 +16,109 @@ import {
   type UserProfile,
 } from "./data"
 
+// ✅ NEW: WebSocket Service
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class WebSocketBridge {
+  private ws: WebSocket | null = null
+  private reconnectAttempts = 0
+  private maxReconnectAttempts = 5
+  private reconnectDelay = 2000
+  private isConnecting = false
+
+  connect(
+    onMessage: (data: any) => void,
+    onError: (err: string) => void,
+    onConnected: () => void
+  ) {
+    if (this.isConnecting || this.ws?.readyState === WebSocket.OPEN) {
+      return
+    }
+
+    this.isConnecting = true
+    try {
+      // ✅ Connect to Bridge WebSocket (port 9000)
+      this.ws = new WebSocket("ws://localhost:8443")
+
+      this.ws.onopen = () => {
+        console.log("✅ Connected to WebSocket Bridge")
+        this.reconnectAttempts = 0
+        this.isConnecting = false
+        onConnected()
+      }
+
+      this.ws.onmessage = (event) => {
+        try {
+          const response = JSON.parse(event.data)
+          console.log("📥 Response from server:", response)
+          onMessage(response)
+        } catch (e) {
+          console.error("Failed to parse message:", e)
+        }
+      }
+
+      this.ws.onerror = (error) => {
+        console.error("❌ WebSocket error:", error)
+        this.isConnecting = false
+        onError("Connection error")
+      }
+
+      this.ws.onclose = () => {
+        console.log("🔌 Disconnected from bridge")
+        this.isConnecting = false
+        this.attemptReconnect(onMessage, onError, onConnected)
+      }
+    } catch (error) {
+      console.error("Failed to create WebSocket:", error)
+      this.isConnecting = false
+      onError(String(error))
+    }
+  }
+
+  private attemptReconnect(
+    onMessage: (data: any) => void,
+    onError: (err: string) => void,
+    onConnected: () => void
+  ) {
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++
+      console.log(
+        `🔄 Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`
+      )
+      setTimeout(
+        () => this.connect(onMessage, onError, onConnected),
+        this.reconnectDelay
+      )
+    } else {
+      onError("Failed to reconnect after multiple attempts")
+    }
+  }
+
+  sendMessage(message: string) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      console.log("📤 Sending to server:", message)
+      this.ws.send(message)
+    } else {
+      console.warn("⚠️ WebSocket not connected")
+    }
+  }
+
+  login(username: string, password: string) {
+    // Format: LOGIN,,username;password
+    const loginMsg = `LOGIN,,${username};${password}`
+    this.sendMessage(loginMsg)
+  }
+
+  disconnect() {
+    if (this.ws) {
+      this.ws.close()
+      this.ws = null
+    }
+  }
+}
+
+// Export singleton
+const wsService = new WebSocketBridge()
+
 // ─── Shared UI Components ─────────────────────────────────────────────────────
 
 function Toast({
@@ -342,7 +445,6 @@ interface MatchRecord {
 }
 
 function generateMatchHistory(user: UserProfile): MatchRecord[] {
-  // Seeded pseudo-random generator so the same user always sees the same history
   let seed = 1
   for (let i = 0; i < user.username.length; i++)
     seed = (seed * 31 + user.username.charCodeAt(i)) % 233280
@@ -982,27 +1084,77 @@ function AuthPage({ onLogin }: { onLogin: (u: UserProfile) => void }) {
     type: "success" | "error"
   } | null>(null)
   const [loading, setLoading] = useState(false)
+  const [wsStatus, setWsStatus] = useState<"connecting" | "connected" | "error">(
+    "connecting"
+  )
+
+  // ✅ NEW: Connect to WebSocket on mount
+  useEffect(() => {
+    wsService.connect(
+      (response) => {
+        if (response.type === "connected") {
+          console.log("✅ Server is ready")
+          setWsStatus("connected")
+        } else if (response.type === "message") {
+          console.log("📨 Server message:", response.data)
+          handleServerResponse(response.data)
+        } else if (response.type === "error") {
+          setToast({ msg: response.message, type: "error" })
+        }
+      },
+      (err) => {
+        console.error("WebSocket error:", err)
+        setWsStatus("error")
+        setToast({ msg: `Lỗi kết nối: ${err}`, type: "error" })
+      },
+      () => {
+        setWsStatus("connected")
+      }
+    )
+
+    return () => {
+      wsService.disconnect()
+    }
+  }, [])
+
+  // ✅ NEW: Handle server response
+  const handleServerResponse = (message: string) => {
+    console.log("Processing server message:", message)
+    // Parse response từ server
+    // Format: "LOGIN_SUCCESS,,userId:123" hoặc "LOGIN_FAIL,,reason"
+    if (message.startsWith("LOGIN_SUCCESS")) {
+      show("Đăng nhập thành công! Chào mừng trở lại 👋", "success")
+      setTimeout(() => onLogin(MOCK_USER), 1200)
+    } else if (message.startsWith("LOGIN_FAIL")) {
+      show("Tên đăng nhập hoặc mật khẩu không đúng!", "error")
+    }
+  }
 
   const show = (msg: string, type: "success" | "error") =>
     setToast({ msg, type })
   const set = (k: string, v: string) => setForm((f) => ({ ...f, [k]: v }))
 
+  // ✅ CHANGED: Use WebSocket instead of mock
   const handleLogin = () => {
     if (!form.username.trim() || !form.password) {
       show("Vui lòng nhập đầy đủ thông tin!", "error")
       return
     }
+
+    if (wsStatus !== "connected") {
+      show("Chưa kết nối tới server. Vui lòng đợi...", "error")
+      return
+    }
+
     setLoading(true)
+
+    // ✅ Send login request via WebSocket to bridge
+    wsService.login(form.username, form.password)
+
+    // Timeout sau 5 giây
     setTimeout(() => {
       setLoading(false)
-      const match = VALID_ACCOUNTS.find(
-        (a) => a.username === form.username && a.password === form.password,
-      )
-      if (match) {
-        show("Đăng nhập thành công! Chào mừng trở lại 👋", "success")
-        setTimeout(() => onLogin(MOCK_USER), 1200)
-      } else show("Tên đăng nhập hoặc mật khẩu không đúng!", "error")
-    }, 900)
+    }, 5000)
   }
 
   const handleRegister = () => {
@@ -1080,6 +1232,51 @@ function AuthPage({ onLogin }: { onLogin: (u: UserProfile) => void }) {
           >
             online · competitive · strategy
           </p>
+
+          {/* ✅ NEW: WebSocket status indicator */}
+          <div
+            className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs"
+            style={{
+              background:
+                wsStatus === "connected"
+                  ? "rgba(74,222,128,0.12)"
+                  : wsStatus === "connecting"
+                    ? "rgba(247,192,79,0.12)"
+                    : "rgba(248,113,113,0.12)",
+              border:
+                wsStatus === "connected"
+                  ? "1px solid rgba(74,222,128,0.3)"
+                  : wsStatus === "connecting"
+                    ? "1px solid rgba(247,192,79,0.3)"
+                    : "1px solid rgba(248,113,113,0.3)",
+              color:
+                wsStatus === "connected"
+                  ? "#4ade80"
+                  : wsStatus === "connecting"
+                    ? "#f7c04f"
+                    : "#f87171",
+              fontFamily: "var(--font-mono)",
+            }}
+          >
+            <div
+              className={`w-2 h-2 rounded-full ${
+                wsStatus === "connecting" ? "animate-pulse" : ""
+              }`}
+              style={{
+                background:
+                  wsStatus === "connected"
+                    ? "#4ade80"
+                    : wsStatus === "connecting"
+                      ? "#f7c04f"
+                      : "#f87171",
+              }}
+            />
+            {wsStatus === "connected"
+              ? "✅ Kết nối server"
+              : wsStatus === "connecting"
+                ? "⏳ Đang kết nối..."
+                : "❌ Lỗi kết nối"}
+          </div>
         </div>
 
         <div className="glass rounded-2xl overflow-hidden shadow-2xl">
@@ -1153,9 +1350,13 @@ function AuthPage({ onLogin }: { onLogin: (u: UserProfile) => void }) {
                 <button
                   className="btn-primary w-full mt-2"
                   onClick={handleLogin}
-                  disabled={loading}
+                  disabled={loading || wsStatus !== "connected"}
                 >
-                  {loading ? "Đang xử lý..." : "ĐĂNG NHẬP"}
+                  {loading
+                    ? "Đang xử lý..."
+                    : wsStatus !== "connected"
+                      ? "Kết nối server..."
+                      : "ĐĂNG NHẬP"}
                 </button>
                 <p
                   className="text-xs text-center"
