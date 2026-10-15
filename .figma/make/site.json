@@ -1,0 +1,10 @@
+{
+  "description": "Create stunning color palettes effortlessly with harmony rules and export options, perfect for designers and artists seeking inspiration and efficiency.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
