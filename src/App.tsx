@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import GamePage from "./GamePage"
 import CreateRoomPage from "./CreateRoomPage"
 import {
@@ -16,80 +16,111 @@ import {
   type UserProfile,
 } from "./data"
 
-// ✅ NEW: WebSocket Service
+// ✅ WebSocket Service (singleton dùng chung cho toàn bộ app)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+type WsStatus = "connecting" | "connected" | "error"
+type WsMessageListener = (data: any) => void
+
 class WebSocketBridge {
   private ws: WebSocket | null = null
   private reconnectAttempts = 0
   private maxReconnectAttempts = 5
   private reconnectDelay = 2000
   private isConnecting = false
+  private manualClose = false
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private status: WsStatus = "connecting"
+  private messageListeners = new Set<WsMessageListener>()
+  private statusListeners = new Set<(s: WsStatus) => void>()
 
-  connect(
-    onMessage: (data: any) => void,
-    onError: (err: string) => void,
-    onConnected: () => void
-  ) {
+  getStatus() {
+    return this.status
+  }
+
+  private setStatus(s: WsStatus) {
+    this.status = s
+    this.statusListeners.forEach((fn) => fn(s))
+  }
+
+  // Đăng ký nhận message từ server. Trả về hàm huỷ đăng ký.
+  subscribe(fn: WsMessageListener) {
+    this.messageListeners.add(fn)
+    return () => {
+      this.messageListeners.delete(fn)
+    }
+  }
+
+  // Đăng ký nhận thay đổi trạng thái kết nối. Trả về hàm huỷ đăng ký.
+  onStatusChange(fn: (s: WsStatus) => void) {
+    this.statusListeners.add(fn)
+    return () => {
+      this.statusListeners.delete(fn)
+    }
+  }
+
+  connect() {
     if (this.isConnecting || this.ws?.readyState === WebSocket.OPEN) {
       return
     }
 
+    this.manualClose = false
     this.isConnecting = true
+    this.setStatus("connecting")
     try {
-      // ✅ Connect to Bridge WebSocket (port 9000)
-      this.ws = new WebSocket("ws://localhost:8443")
+      // ✅ Connect to Bridge WebSocket
+      const socket = new WebSocket("ws://localhost:8443")
+      this.ws = socket
 
-      this.ws.onopen = () => {
+      socket.onopen = () => {
+        if (this.ws !== socket) return
         console.log("✅ Connected to WebSocket Bridge")
         this.reconnectAttempts = 0
         this.isConnecting = false
-        onConnected()
+        this.setStatus("connected")
       }
 
-      this.ws.onmessage = (event) => {
+      socket.onmessage = (event) => {
+        if (this.ws !== socket) return
         try {
           const response = JSON.parse(event.data)
           console.log("📥 Response from server:", response)
-          onMessage(response)
+          this.messageListeners.forEach((fn) => fn(response))
         } catch (e) {
           console.error("Failed to parse message:", e)
         }
       }
 
-      this.ws.onerror = (error) => {
+      socket.onerror = (error) => {
+        if (this.ws !== socket) return
         console.error("❌ WebSocket error:", error)
         this.isConnecting = false
-        onError("Connection error")
+        this.setStatus("error")
       }
 
-      this.ws.onclose = () => {
+      socket.onclose = () => {
+        if (this.ws !== socket) return
         console.log("🔌 Disconnected from bridge")
+        this.ws = null
         this.isConnecting = false
-        this.attemptReconnect(onMessage, onError, onConnected)
+        if (!this.manualClose) this.attemptReconnect()
       }
     } catch (error) {
       console.error("Failed to create WebSocket:", error)
       this.isConnecting = false
-      onError(String(error))
+      this.setStatus("error")
     }
   }
 
-  private attemptReconnect(
-    onMessage: (data: any) => void,
-    onError: (err: string) => void,
-    onConnected: () => void
-  ) {
+  private attemptReconnect() {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++
       console.log(
         `🔄 Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`
       )
-      setTimeout(
-        () => this.connect(onMessage, onError, onConnected),
-        this.reconnectDelay
-      )
+      this.setStatus("connecting")
+      this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay)
     } else {
-      onError("Failed to reconnect after multiple attempts")
+      this.setStatus("error")
     }
   }
 
@@ -109,15 +140,122 @@ class WebSocketBridge {
   }
 
   disconnect() {
-    if (this.ws) {
-      this.ws.close()
-      this.ws = null
+    this.manualClose = true
+    this.isConnecting = false
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
     }
+    const socket = this.ws
+    this.ws = null
+    if (socket) socket.close()
   }
 }
 
 // Export singleton
 const wsService = new WebSocketBridge()
+
+// ─── Tab Session (sessionStorage: mỗi tab một phiên riêng) ────────────────────
+
+const SESSION_KEY = "dnb_tab_session"
+
+interface TabSession {
+  sessionId: string
+  username: string
+}
+
+// Trả về session của tab hiện tại nếu sessionId đã được gắn với một user
+function loadTabSession(): TabSession | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (
+      parsed &&
+      typeof parsed.sessionId === "string" &&
+      parsed.sessionId &&
+      typeof parsed.username === "string" &&
+      parsed.username
+    ) {
+      return { sessionId: parsed.sessionId, username: parsed.username }
+    }
+  } catch {
+    // ignore
+  }
+  return null
+}
+
+// sessionId = session id do server cấp (SET_SESSION_ID) sau khi đăng nhập
+function saveTabSession(username: string, sessionId: string) {
+  try {
+    const session: TabSession = { sessionId, username }
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(session))
+  } catch {
+    // ignore
+  }
+}
+
+function clearTabSession() {
+  try {
+    sessionStorage.removeItem(SESSION_KEY)
+  } catch {
+    // ignore
+  }
+}
+
+// ─── Server data helpers ──────────────────────────────────────────────────────
+
+// Các opcode server có thể dùng để trả về dữ liệu user
+const USER_DATA_OPCODES = [
+  "RETURN_USER_DETAIL", // opcode server thực tế trả về
+  "USER_DATA",
+  "REPLY_GET_USER_DETAIL",
+  "GET_USER_DETAIL",
+]
+
+// Server trả: username;displayName;ranking;status (cũng chấp nhận JSON)
+function parseUserDetail(params: string): any {
+  const trimmed = params.trim()
+  if (trimmed.startsWith("{")) return JSON.parse(trimmed)
+  const [username, displayName, ranking, status] = params.split(";")
+  return { username, displayName, ranking: Number(ranking), status }
+}
+
+// Convert ranking points to rank tier
+const mapRankingToTier = (ranking: number): string => {
+  if (ranking >= 2000) return "Huyền thoại"
+  if (ranking >= 1800) return "Kim cương"
+  if (ranking >= 1600) return "Vàng"
+  if (ranking >= 1400) return "Bạc"
+  if (ranking >= 1200) return "Đồng"
+  return "Sắt"
+}
+
+// Map database fields → UserProfile (an toàn khi thiếu field)
+function buildUserProfile(userData: any, fallbackUsername: string): UserProfile {
+  const username: string = userData?.username || fallbackUsername
+  const displayName: string = userData?.displayName || username
+  const ranking = Number(userData?.ranking) || 0
+  const initials =
+    displayName
+      .split(" ")
+      .filter(Boolean)
+      .map((n: string) => n[0])
+      .join("")
+      .toUpperCase() || username.slice(0, 2).toUpperCase()
+
+  return {
+    initials,
+    username,
+    flag: "🇻🇳", // Default nếu không có trong DB
+    nationality: "Việt Nam", // Default nếu không có trong DB
+    rankTier: mapRankingToTier(ranking),
+    rankPoints: ranking,
+    money: 50000, // Default nếu không có trong DB
+    gamesPlayed: userData?.totalMatches || 0,
+    gamesWon: userData?.totalWins || 0,
+  } as UserProfile
+}
 
 // ─── Shared UI Components ─────────────────────────────────────────────────────
 
@@ -763,7 +901,7 @@ function PlayerPopup({
         </div>
         <div
           className="flex items-center justify-center gap-2 mb-4 py-2 px-4 rounded-lg"
-          style={{ background: `${rc}18`, border: `1px solid ${rc}40` }}
+          style={{ background: `${rc}18`, border: `1.5px solid ${rc}60` }}
         >
           <span className="text-xl">{rankIcon(user.rankTier)}</span>
           <div>
@@ -787,8 +925,8 @@ function PlayerPopup({
         <div
           className="flex items-center justify-between px-3 py-2 rounded-lg mb-4"
           style={{
-            background: "rgba(247,192,79,0.1)",
-            border: "1px solid rgba(247,192,79,0.25)",
+            background: "rgba(247,192,79,0.12)",
+            border: "1.5px solid rgba(247,192,79,0.45)",
           }}
         >
           <span
@@ -821,8 +959,8 @@ function PlayerPopup({
               key={s.label}
               className="rounded-lg py-3 text-center"
               style={{
-                background: "rgba(255,255,255,0.04)",
-                border: "1px solid rgba(255,255,255,0.07)",
+                background: "rgba(255,255,255,0.05)",
+                border: "1.5px solid rgba(255,255,255,0.15)",
               }}
             >
               <p
@@ -967,9 +1105,11 @@ function RulesModal({ onClose }: { onClose: () => void }) {
 function SettingsModal({
   onClose,
   onLogout,
+  username,
 }: {
   onClose: () => void
-  onLogout: () => void
+  onLogout: (username: string) => void
+  username: string
 }) {
   const [vol, setVol] = useState(70)
   const [notif, setNotif] = useState(true)
@@ -1052,7 +1192,7 @@ function SettingsModal({
           >
             <button
               className="btn-danger w-full text-sm py-2"
-              onClick={onLogout}
+              onClick={() => onLogout(username)}
             >
               Đăng xuất
             </button>
@@ -1070,7 +1210,13 @@ const VALID_ACCOUNTS = [
   { username: "admin", password: "admin" },
 ]
 
-function AuthPage({ onLogin }: { onLogin: (u: UserProfile) => void }) {
+function AuthPage({
+  onLogin,
+  wsStatus,
+}: {
+  onLogin: (u: UserProfile, serverSessionId: string | null) => void
+  wsStatus: WsStatus
+}) {
   const [tab, setTab] = useState<"login" | "register">("login")
   const [form, setForm] = useState({
     username: "",
@@ -1084,49 +1230,112 @@ function AuthPage({ onLogin }: { onLogin: (u: UserProfile) => void }) {
     type: "success" | "error"
   } | null>(null)
   const [loading, setLoading] = useState(false)
-  const [wsStatus, setWsStatus] = useState<"connecting" | "connected" | "error">(
-    "connecting"
-  )
 
-  // ✅ NEW: Connect to WebSocket on mount
+  // Refs để tránh stale closure trong callback WebSocket
+  const pendingUsernameRef = useRef("")
+  const serverSessionIdRef = useRef<string | null>(null)
+  const fallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const loginTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const onLoginRef = useRef(onLogin)
+  onLoginRef.current = onLogin
+
+  const clearTimers = () => {
+    if (fallbackTimerRef.current) {
+      clearTimeout(fallbackTimerRef.current)
+      fallbackTimerRef.current = null
+    }
+    if (loginTimeoutRef.current) {
+      clearTimeout(loginTimeoutRef.current)
+      loginTimeoutRef.current = null
+    }
+  }
+
+  // ✅ Lắng nghe message từ server (kết nối WebSocket do App quản lý)
   useEffect(() => {
-    wsService.connect(
-      (response) => {
-        if (response.type === "connected") {
-          console.log("✅ Server is ready")
-          setWsStatus("connected")
-        } else if (response.type === "message") {
-          console.log("📨 Server message:", response.data)
-          handleServerResponse(response.data)
-        } else if (response.type === "error") {
-          setToast({ msg: response.message, type: "error" })
-        }
-      },
-      (err) => {
-        console.error("WebSocket error:", err)
-        setWsStatus("error")
-        setToast({ msg: `Lỗi kết nối: ${err}`, type: "error" })
-      },
-      () => {
-        setWsStatus("connected")
+    const unsubscribe = wsService.subscribe((response) => {
+      if (response.type === "message") {
+        console.log("📨 Server message:", response.data)
+        handleServerResponse(response.data)
+      } else if (response.type === "error") {
+        setToast({ msg: response.message, type: "error" })
+        setLoading(false)
       }
-    )
-
+    })
     return () => {
-      wsService.disconnect()
+      unsubscribe()
+      clearTimers()
     }
   }, [])
 
-  // ✅ NEW: Handle server response
+  // ✅ Handle server response with proper opcode parsing
   const handleServerResponse = (message: string) => {
+    if (typeof message !== "string") return
     console.log("Processing server message:", message)
-    // Parse response từ server
-    // Format: "LOGIN_SUCCESS,,userId:123" hoặc "LOGIN_FAIL,,reason"
-    if (message.startsWith("LOGIN_SUCCESS")) {
-      show("Đăng nhập thành công! Chào mừng trở lại 👋", "success")
-      setTimeout(() => onLogin(MOCK_USER), 1200)
-    } else if (message.startsWith("LOGIN_FAIL")) {
-      show("Tên đăng nhập hoặc mật khẩu không đúng!", "error")
+
+    // Parse opcode format: "OPCODE,,PARAMS"
+    const [opcode, ...rest] = message.split(",,")
+    const params = rest.join(",,")
+
+    // Handle REPLY_LOGIN opcode
+    if (opcode === "REPLY_LOGIN") {
+      const statusMap: Record<string, string> = {
+        LOGIN_SUCCESS: "✅ Đăng nhập thành công! Chào mừng trở lại 👋",
+        UNKNOWN_USERNAME: "❌ Tên đăng nhập không tồn tại",
+        WRONG_PASSWORD: "❌ Mật khẩu sai",
+        ACCOUNT_ALREADY_ONLINE: "❌ Tài khoản đang online",
+      }
+
+      const statusMessage = statusMap[params] || `❌ Lỗi: ${params}`
+      const type = params === "LOGIN_SUCCESS" ? "success" : "error"
+
+      show(statusMessage, type)
+
+      if (params === "LOGIN_SUCCESS") {
+        // Request user data từ database (dùng ref, không dùng form state cũ)
+        const username = pendingUsernameRef.current
+        console.log("📤 Requesting user data from server...")
+        wsService.sendMessage(`GET_USER_DETAIL,,${username}`)
+
+        // Nếu server không trả dữ liệu user, vẫn chuyển vào trang chủ
+        if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current)
+        fallbackTimerRef.current = setTimeout(() => {
+          fallbackTimerRef.current = null
+          console.warn("⚠️ No user data from server, using default profile")
+          onLoginRef.current(
+            buildUserProfile(null, username),
+            serverSessionIdRef.current
+          )
+        }, 3000)
+      } else {
+        clearTimers()
+        setLoading(false)
+      }
+    }
+    // Server cấp session id ngay sau khi đăng nhập thành công
+    else if (opcode === "SET_SESSION_ID") {
+      serverSessionIdRef.current = params.trim() || null
+    }
+    // Handle GET_USER_DETAIL response (user data từ database)
+    else if (USER_DATA_OPCODES.includes(opcode)) {
+      if (!pendingUsernameRef.current) return
+      if (fallbackTimerRef.current) {
+        clearTimeout(fallbackTimerRef.current)
+        fallbackTimerRef.current = null
+      }
+      try {
+        const userData = parseUserDetail(params)
+        console.log("📥 Received user data from database:", userData)
+        const userProfile = buildUserProfile(
+          userData,
+          pendingUsernameRef.current
+        )
+        console.log("✅ Converted user profile:", userProfile)
+        onLoginRef.current(userProfile, serverSessionIdRef.current)
+      } catch (error) {
+        console.error("❌ Failed to parse user data:", error)
+        show("Lỗi khi lấy dữ liệu người dùng", "error")
+        setLoading(false)
+      }
     }
   }
 
@@ -1134,7 +1343,7 @@ function AuthPage({ onLogin }: { onLogin: (u: UserProfile) => void }) {
     setToast({ msg, type })
   const set = (k: string, v: string) => setForm((f) => ({ ...f, [k]: v }))
 
-  // ✅ CHANGED: Use WebSocket instead of mock
+  // ✅ Use WebSocket
   const handleLogin = () => {
     if (!form.username.trim() || !form.password) {
       show("Vui lòng nhập đầy đủ thông tin!", "error")
@@ -1147,12 +1356,17 @@ function AuthPage({ onLogin }: { onLogin: (u: UserProfile) => void }) {
     }
 
     setLoading(true)
+    pendingUsernameRef.current = form.username
+    serverSessionIdRef.current = null
 
-    // ✅ Send login request via WebSocket to bridge
-    wsService.login(form.username, form.password)
+    // ✅ Send login request with correct opcode format
+    // Format: "LOGIN,,username;password"
+    const loginMessage = `LOGIN,,${form.username};${form.password}`
+    wsService.sendMessage(loginMessage)
 
     // Timeout sau 5 giây
-    setTimeout(() => {
+    if (loginTimeoutRef.current) clearTimeout(loginTimeoutRef.current)
+    loginTimeoutRef.current = setTimeout(() => {
       setLoading(false)
     }, 5000)
   }
@@ -1506,6 +1720,7 @@ function HomePage({
   onSizeChange,
   onPlayGame,
   onCreateRoom,
+  onLogout,
 }: {
   user: UserProfile
   onNavigate: (p: Page) => void
@@ -1513,6 +1728,7 @@ function HomePage({
   onSizeChange: (s: SizeFilter) => void
   onPlayGame: () => void
   onCreateRoom: () => void
+  onLogout: (username: string) => void
 }) {
   const [showProfile, setShowProfile] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -2156,7 +2372,8 @@ function HomePage({
       {showSettings && (
         <SettingsModal
           onClose={() => setShowSettings(false)}
-          onLogout={() => window.location.reload()}
+          onLogout={onLogout}
+          username={user.username}
         />
       )}
       {showRules && <RulesModal onClose={() => setShowRules(false)} />}
@@ -2192,10 +2409,120 @@ export default function App() {
   const [page, setPage] = useState<Page>("auth")
   const [user, setUser] = useState<UserProfile | null>(null)
   const [selectedSize, setSelectedSize] = useState<SizeFilter>(4)
+  const [wsStatus, setWsStatus] = useState<WsStatus>(wsService.getStatus())
 
-  const handleLogin = (u: UserProfile) => {
+  // ✅ Session của TAB hiện tại (sessionStorage): có user gắn với session → khôi phục
+  const [savedSession] = useState<TabSession | null>(() => loadTabSession())
+  const [restoring, setRestoring] = useState<boolean>(savedSession !== null)
+  const restoringRef = useRef<boolean>(savedSession !== null)
+
+  const endRestore = () => {
+    restoringRef.current = false
+    setRestoring(false)
+  }
+
+  const failRestore = () => {
+    clearTabSession()
+    endRestore()
+  }
+
+  // ✅ Kết nối WebSocket một lần ở cấp App (không bị đóng khi chuyển trang)
+  useEffect(() => {
+    const offStatus = wsService.onStatusChange(setWsStatus)
+    const offMessage = wsService.subscribe((response) => {
+      if (!restoringRef.current || !savedSession) return
+      if (response?.type !== "message") return
+
+      const [opcode, ...rest] = String(response.data).split(",,")
+      const params = rest.join(",,")
+
+      // Server không còn session này (đã bị xóa) → về trang đăng nhập
+      if (opcode === "REPLY_LOGOUT") {
+        failRestore()
+        return
+      }
+
+      // Attach thành công → lấy dữ liệu user
+      if (opcode === "REPLY_ATTACH") {
+        if (params.trim() === "ATTACH_SUCCESS") {
+          wsService.sendMessage(`GET_USER_DETAIL,,${savedSession.username}`)
+        } else {
+          failRestore()
+        }
+        return
+      }
+
+      if (!USER_DATA_OPCODES.includes(opcode)) return
+      try {
+        const profile = buildUserProfile(
+          parseUserDetail(params),
+          savedSession.username
+        )
+        console.log("♻️ Session restored for:", profile.username)
+        setUser(profile)
+        setPage("home")
+        endRestore()
+      } catch (error) {
+        console.error("❌ Failed to restore session:", error)
+        failRestore()
+      }
+    })
+
+    wsService.connect()
+    setWsStatus(wsService.getStatus())
+
+    return () => {
+      offMessage()
+      offStatus()
+      wsService.disconnect()
+    }
+  }, [])
+
+  // ✅ Khi đã kết nối mà tab đang có session → lấy lại dữ liệu user và vào thẳng trang chủ
+  useEffect(() => {
+    if (!restoring || !savedSession) return
+
+    if (wsStatus === "error") {
+      // Không kết nối được server: hiện trang đăng nhập, giữ session để thử lại sau
+      endRestore()
+      return
+    }
+    if (wsStatus !== "connected") return
+
+    console.log("📤 Attaching session:", savedSession.sessionId)
+    wsService.sendMessage(`ATTACH_REQUEST,,${savedSession.sessionId}`)
+
+    const timeout = setTimeout(() => {
+      if (restoringRef.current) {
+        console.warn("⚠️ Session restore timed out")
+        failRestore()
+      }
+    }, 5000)
+    return () => clearTimeout(timeout)
+  }, [wsStatus, restoring])
+
+  const handleLogin = (u: UserProfile, serverSessionId: string | null) => {
+    // ✅ gắn session id (do server cấp) của tab với user
+    if (serverSessionId) saveTabSession(u.username, serverSessionId)
+    else clearTabSession()
     setUser(u)
     setTimeout(() => setPage("home"), 300)
+  }
+
+  // ✅ Handle logout - send LOGOUT opcode to server
+  const handleLogout = (username: string) => {
+    console.log("📤 Sending logout request for:", username)
+
+    // Server yêu cầu: "LOGOUT,,sessionId" (không phải username)
+    const sessionId = loadTabSession()?.sessionId
+    if (sessionId) wsService.sendMessage(`LOGOUT,,${sessionId}`)
+
+    // Xoá session của tab và quay lại trang đăng nhập
+    clearTabSession()
+    setUser(null)
+    setPage("auth")
+
+    console.log("✅ User logged out: " + username)
   }
 
   const handlePlayGame = () => {
@@ -2208,7 +2535,22 @@ export default function App() {
 
   const effectiveSize: BoardSize = selectedSize === "any" ? 4 : selectedSize
 
-  if (page === "auth") return <AuthPage onLogin={handleLogin} />
+  if (restoring)
+    return (
+      <div className="dot-grid min-h-screen flex items-center justify-center">
+        <div className="glass rounded-xl px-6 py-3.5 flex items-center gap-3">
+          <div className="w-4 h-4 rounded-full border-2 border-blue-400 border-t-transparent animate-spin" />
+          <span
+            className="text-sm font-medium"
+            style={{ color: "#4f8ef7", fontFamily: "var(--font-mono)" }}
+          >
+            Đang khôi phục phiên đăng nhập...
+          </span>
+        </div>
+      </div>
+    )
+
+  if (page === "auth") return <AuthPage onLogin={handleLogin} wsStatus={wsStatus} />
   if (!user) return null
   if (page === "game")
     return (
@@ -2238,6 +2580,7 @@ export default function App() {
       onSizeChange={setSelectedSize}
       onPlayGame={handlePlayGame}
       onCreateRoom={handleCreateRoom}
+      onLogout={handleLogout}
     />
   )
 }

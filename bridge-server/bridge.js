@@ -95,21 +95,26 @@ wss.on('connection', (ws) => {
   // 3️⃣  Receive data from Java Server (TCP Socket)
   // ─────────────────────────────────────────────────────────────
 
-  tcpSocket.on('data', (buffer) => {
-    console.log(`\n📥 SERVER → BRIDGE:\n   Raw data: ${buffer.length} bytes`);
-    console.log(`   Hex: ${buffer.toString('hex').substring(0, 40)}...`);
+  // TCP là stream: 1 lần 'data' có thể chứa nhiều frame (vd REPLY_LOGIN + SET_SESSION_ID)
+  // hoặc chỉ một phần frame → gom vào buffer rồi tách từng frame theo độ dài.
+  let pending = Buffer.alloc(0);
 
-    // Decode TCP frame back to message
-    const message = decodeFrame(buffer);
-    console.log(`   Decoded: "${message}"`);
+  tcpSocket.on('data', (chunk) => {
+    pending = Buffer.concat([pending, chunk]);
 
-    // Send message to React via WebSocket
-    ws.send(JSON.stringify({
-      type: 'message',
-      data: message
-    }));
+    while (pending.length >= 16) {
+      const payloadLength = pending.readInt32BE(0);
+      const frameSize = 16 + payloadLength;
+      if (pending.length < frameSize) break; // chưa đủ frame, chờ thêm dữ liệu
 
-    console.log(`📤 BRIDGE → BROWSER:\n   "${message}"`);
+      const message = pending.slice(16, frameSize).toString('utf-8');
+      pending = pending.slice(frameSize);
+
+      console.log(`\n📥 SERVER → BRIDGE → BROWSER:\n   "${message}"`);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'message', data: message }));
+      }
+    }
   });
 
   // ─────────────────────────────────────────────────────────────
