@@ -8,6 +8,7 @@ import {
   type OnlinePlayer,
   type OfflinePlayer,
 } from "./data"
+import { SUPPORTED_BOARD_SIZE } from "./services/protocol"
 
 // ─── Player Row ───────────────────────────────────────────────────────────────
 
@@ -95,15 +96,9 @@ interface Props {
   user: UserProfile
   defaultSize: BoardSize
   onBack: () => void
-  onStart: (size: BoardSize) => void
 }
 
-export default function CreateRoomPage({
-  user,
-  defaultSize,
-  onBack,
-  onStart,
-}: Props) {
+export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
   const [size, setSize] = useState<BoardSize>(defaultSize)
   const [roomName, setRoomName] = useState(`Phòng của ${user.username}`)
   const [toast, setToast] = useState<string | null>(null)
@@ -115,6 +110,21 @@ export default function CreateRoomPage({
 
   const handleInvite = (p: OnlinePlayer) =>
     showToast(`✅ Đã gửi lời mời đến ${p.username}!`)
+
+  // Server mới hỗ trợ bàn 3×3: 4×4 và 5×5 vẫn hiển thị nhưng chưa cho chọn
+  const handleSizeClick = (n: BoardSize) => {
+    if (n !== SUPPORTED_BOARD_SIZE) {
+      showToast(
+        `🚧 Bàn ${n}×${n} đang được phát triển — hiện chỉ hỗ trợ bàn ${SUPPORTED_BOARD_SIZE}×${SUPPORTED_BOARD_SIZE}`
+      )
+      return
+    }
+    setSize(n)
+  }
+
+  // Server chưa có xử lý tạo phòng tùy chỉnh (CREATE_CUSTOM_ROOM) nên chưa bắt đầu được trận
+  const handleStart = () =>
+    showToast("🚧 Chức năng tạo phòng đang được phát triển")
 
   return (
     <div
@@ -198,7 +208,7 @@ export default function CreateRoomPage({
                 {BOARD_SIZE_OPTIONS.map((opt) => (
                   <button
                     key={opt.n}
-                    onClick={() => setSize(opt.n)}
+                    onClick={() => handleSizeClick(opt.n)}
                     className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-left transition-all"
                     style={{
                       background:
@@ -246,7 +256,7 @@ export default function CreateRoomPage({
             {/* Start button */}
             <button
               className="btn-primary w-full py-3 text-base"
-              onClick={() => onStart(size)}
+              onClick={handleStart}
             >
               ▶ BẮT ĐẦU PHÒNG
             </button>

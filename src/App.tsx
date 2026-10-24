@@ -13,147 +13,22 @@ import {
   getWinRate,
   type Page,
   type BoardSize,
+  type RankTier,
   type UserProfile,
 } from "./data"
 
-// ✅ WebSocket Service (singleton dùng chung cho toàn bộ app)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-type WsStatus = "connecting" | "connected" | "error"
-type WsMessageListener = (data: any) => void
-
-class WebSocketBridge {
-  private ws: WebSocket | null = null
-  private reconnectAttempts = 0
-  private maxReconnectAttempts = 5
-  private reconnectDelay = 2000
-  private isConnecting = false
-  private manualClose = false
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  private status: WsStatus = "connecting"
-  private messageListeners = new Set<WsMessageListener>()
-  private statusListeners = new Set<(s: WsStatus) => void>()
-
-  getStatus() {
-    return this.status
-  }
-
-  private setStatus(s: WsStatus) {
-    this.status = s
-    this.statusListeners.forEach((fn) => fn(s))
-  }
-
-  // Đăng ký nhận message từ server. Trả về hàm huỷ đăng ký.
-  subscribe(fn: WsMessageListener) {
-    this.messageListeners.add(fn)
-    return () => {
-      this.messageListeners.delete(fn)
-    }
-  }
-
-  // Đăng ký nhận thay đổi trạng thái kết nối. Trả về hàm huỷ đăng ký.
-  onStatusChange(fn: (s: WsStatus) => void) {
-    this.statusListeners.add(fn)
-    return () => {
-      this.statusListeners.delete(fn)
-    }
-  }
-
-  connect() {
-    if (this.isConnecting || this.ws?.readyState === WebSocket.OPEN) {
-      return
-    }
-
-    this.manualClose = false
-    this.isConnecting = true
-    this.setStatus("connecting")
-    try {
-      // ✅ Connect to Bridge WebSocket
-      const socket = new WebSocket("ws://localhost:8443")
-      this.ws = socket
-
-      socket.onopen = () => {
-        if (this.ws !== socket) return
-        console.log("✅ Connected to WebSocket Bridge")
-        this.reconnectAttempts = 0
-        this.isConnecting = false
-        this.setStatus("connected")
-      }
-
-      socket.onmessage = (event) => {
-        if (this.ws !== socket) return
-        try {
-          const response = JSON.parse(event.data)
-          console.log("📥 Response from server:", response)
-          this.messageListeners.forEach((fn) => fn(response))
-        } catch (e) {
-          console.error("Failed to parse message:", e)
-        }
-      }
-
-      socket.onerror = (error) => {
-        if (this.ws !== socket) return
-        console.error("❌ WebSocket error:", error)
-        this.isConnecting = false
-        this.setStatus("error")
-      }
-
-      socket.onclose = () => {
-        if (this.ws !== socket) return
-        console.log("🔌 Disconnected from bridge")
-        this.ws = null
-        this.isConnecting = false
-        if (!this.manualClose) this.attemptReconnect()
-      }
-    } catch (error) {
-      console.error("Failed to create WebSocket:", error)
-      this.isConnecting = false
-      this.setStatus("error")
-    }
-  }
-
-  private attemptReconnect() {
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      this.reconnectAttempts++
-      console.log(
-        `🔄 Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`
-      )
-      this.setStatus("connecting")
-      this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay)
-    } else {
-      this.setStatus("error")
-    }
-  }
-
-  sendMessage(message: string) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      console.log("📤 Sending to server:", message)
-      this.ws.send(message)
-    } else {
-      console.warn("⚠️ WebSocket not connected")
-    }
-  }
-
-  login(username: string, password: string) {
-    // Format: LOGIN,,username;password
-    const loginMsg = `LOGIN,,${username};${password}`
-    this.sendMessage(loginMsg)
-  }
-
-  disconnect() {
-    this.manualClose = true
-    this.isConnecting = false
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-      this.reconnectTimer = null
-    }
-    const socket = this.ws
-    this.ws = null
-    if (socket) socket.close()
-  }
-}
-
-// Export singleton
-const wsService = new WebSocketBridge()
+// ✅ WebSocket Service (singleton dùng chung cho toàn bộ app) — xem src/services/websocket.ts
+import { wsService, type WsStatus } from "./services/websocket"
+// Giao thức game với server (opcode, parser, builder) — xem src/services/protocol.ts
+import {
+  OP,
+  SUPPORTED_BOARD_SIZE,
+  splitServerMessage,
+  parseMatchFound,
+  msgJoinQuickMatch,
+  msgCancelQuickMatch,
+  type ActiveMatch,
+} from "./services/protocol"
 
 // ─── Tab Session (sessionStorage: mỗi tab một phiên riêng) ────────────────────
 
@@ -1713,39 +1588,176 @@ function AuthPage({
 
 // ─── Home Page ────────────────────────────────────────────────────────────────
 
+// Trạng thái tìm trận:
+//   idle       : chưa tìm
+//   joining    : đã gửi JOIN_QUICK_MATCH, chờ REPLY_JOIN_QUICK_MATCH
+//   searching  : đang trong hàng đợi, chờ MATCH_FOUND
+//   cancelling : đã gửi CANCEL_QUICK_MATCH, chờ REPLY_CANCEL_QUICK_MATCH
+type SearchState = "idle" | "joining" | "searching" | "cancelling"
+
+const JOIN_ERROR_TEXT: Record<string, string> = {
+  ALREADY_BUSY: "⚠️ Bạn đang tìm trận hoặc đang trong một trận đấu khác",
+}
+
 function HomePage({
   user,
   onNavigate,
   selectedSize,
   onSizeChange,
-  onPlayGame,
   onCreateRoom,
   onLogout,
+  autoSearch,
+  onAutoSearchHandled,
 }: {
   user: UserProfile
   onNavigate: (p: Page) => void
   selectedSize: SizeFilter
   onSizeChange: (s: SizeFilter) => void
-  onPlayGame: () => void
   onCreateRoom: () => void
   onLogout: (username: string) => void
+  autoSearch: boolean
+  onAutoSearchHandled: () => void
 }) {
   const [showProfile, setShowProfile] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showRules, setShowRules] = useState(false)
-  const [matchToast, setMatchToast] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
 
-  const handleQuickPlay = () => {
-    const label =
-      selectedSize === "any"
-        ? "Tất cả kích thước"
-        : `${selectedSize}×${selectedSize}`
-    setMatchToast(`🔍 Đang tìm đối thủ · Bàn ${label}...`)
-    setTimeout(() => {
-      setMatchToast(null)
-      onPlayGame()
-    }, 1800)
+  const [searchState, setSearchState] = useState<SearchState>("idle")
+  // Ref song song với state để callback WebSocket luôn đọc được giá trị mới nhất
+  const searchRef = useRef<SearchState>("idle")
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const autoStartedRef = useRef(false)
+
+  const updateSearch = (s: SearchState) => {
+    searchRef.current = s
+    setSearchState(s)
   }
+
+  const clearSearchTimer = () => {
+    if (searchTimer.current) {
+      clearTimeout(searchTimer.current)
+      searchTimer.current = null
+    }
+  }
+
+  const showNotice = (msg: string) => {
+    setNotice(msg)
+    if (noticeTimer.current) clearTimeout(noticeTimer.current)
+    noticeTimer.current = setTimeout(() => setNotice(null), 2800)
+  }
+
+  // ✅ Lắng nghe phản hồi ghép trận từ server
+  // (MATCH_FOUND được App xử lý để chuyển sang trang game; ở đây chỉ dọn trạng thái tìm trận)
+  useEffect(() => {
+    const unsubscribe = wsService.subscribe((response) => {
+      if (response?.type !== "message") return
+      const msg = splitServerMessage(response.data)
+      if (!msg) return
+
+      switch (msg.opcode) {
+        case OP.MATCH_FOUND:
+          // Người ghép thứ hai nhận MATCH_FOUND TRƯỚC REPLY_JOIN_QUICK_MATCH → về idle để bỏ qua reply muộn
+          clearSearchTimer()
+          updateSearch("idle")
+          break
+
+        case OP.REPLY_JOIN_QUICK_MATCH: {
+          if (searchRef.current !== "joining") return
+          clearSearchTimer()
+          const status = msg.params.trim()
+          if (status === "SUCCESS" || status === "ALREADY_IN_QUEUE") {
+            updateSearch("searching")
+          } else {
+            updateSearch("idle")
+            showNotice(JOIN_ERROR_TEXT[status] ?? `❌ Không thể tìm trận: ${status}`)
+          }
+          break
+        }
+
+        case OP.REPLY_CANCEL_QUICK_MATCH: {
+          if (searchRef.current !== "cancelling") return
+          clearSearchTimer()
+          updateSearch("idle")
+          // SUCCESS: đã rời hàng đợi. NOT_IN_QUEUE: không còn trong hàng đợi (vd. vừa được ghép trận).
+          if (msg.params.trim() === "SUCCESS") showNotice("Đã hủy tìm trận")
+          break
+        }
+      }
+    })
+    return () => {
+      unsubscribe()
+      clearSearchTimer()
+      if (noticeTimer.current) clearTimeout(noticeTimer.current)
+    }
+  }, [])
+
+  // ✅ CHƠI NHANH → gửi JOIN_QUICK_MATCH, chờ server ghép
+  const handleQuickPlay = () => {
+    if (searchRef.current !== "idle") return
+    if (wsService.getStatus() !== "connected") {
+      showNotice("❌ Chưa kết nối tới server")
+      return
+    }
+
+    // Server hiện chỉ có bàn 3×3 nên "Tất cả kích thước" cũng ghép vào bàn 3×3
+    const size = selectedSize === "any" ? SUPPORTED_BOARD_SIZE : selectedSize
+    updateSearch("joining")
+    wsService.sendMessage(msgJoinQuickMatch(size))
+
+    clearSearchTimer()
+    searchTimer.current = setTimeout(() => {
+      if (searchRef.current === "joining") {
+        updateSearch("idle")
+        showNotice("❌ Server không phản hồi, vui lòng thử lại")
+      }
+    }, 6000)
+  }
+
+  // ✅ HỦY → gửi CANCEL_QUICK_MATCH
+  const handleCancelSearch = () => {
+    if (searchRef.current !== "searching" && searchRef.current !== "joining") return
+    updateSearch("cancelling")
+    wsService.sendMessage(msgCancelQuickMatch())
+
+    clearSearchTimer()
+    searchTimer.current = setTimeout(() => {
+      if (searchRef.current === "cancelling") updateSearch("idle")
+    }, 5000)
+  }
+
+  // Bấm "Tìm trận mới" ở màn hình kết quả → về trang chủ và tự bắt đầu tìm trận
+  useEffect(() => {
+    if (!autoSearch || autoStartedRef.current) return
+    autoStartedRef.current = true
+    onAutoSearchHandled()
+    handleQuickPlay()
+  }, [])
+
+  // Server mới hỗ trợ bàn 3×3: 4×4 và 5×5 vẫn hiển thị nhưng chưa cho chọn
+  const handleSizeClick = (n: BoardSize) => {
+    if (n !== SUPPORTED_BOARD_SIZE) {
+      showNotice(
+        `🚧 Bàn ${n}×${n} đang được phát triển — hiện chỉ hỗ trợ bàn ${SUPPORTED_BOARD_SIZE}×${SUPPORTED_BOARD_SIZE}`
+      )
+      return
+    }
+    onSizeChange(n)
+  }
+
+  // Đang tìm trận mà sang trang tạo phòng thì hủy tìm trận trước
+  const handleCreateRoomClick = () => {
+    if (searchRef.current === "searching" || searchRef.current === "joining") {
+      wsService.sendMessage(msgCancelQuickMatch())
+      updateSearch("idle")
+    }
+    onCreateRoom()
+  }
+
+  const searching = searchState !== "idle"
+  const searchLabel =
+    selectedSize === "any" ? "Tất cả kích thước" : `${selectedSize}×${selectedSize}`
 
   const idlePlayers = ONLINE_PLAYERS.filter((p) => p.status === "idle")
   const playingPlayers = ONLINE_PLAYERS.filter((p) => p.status === "playing")
@@ -1933,7 +1945,7 @@ function HomePage({
               {BOARD_SIZE_OPTIONS.map((opt) => (
                 <button
                   key={opt.n}
-                  onClick={() => onSizeChange(opt.n)}
+                  onClick={() => handleSizeClick(opt.n)}
                   className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left transition-all"
                   style={{
                     background:
@@ -2100,7 +2112,12 @@ function HomePage({
             <button
               className="btn-primary w-full py-4 text-lg flex items-center justify-center gap-3"
               onClick={handleQuickPlay}
-              style={{ borderRadius: 12 }}
+              disabled={searching}
+              style={{
+                borderRadius: 12,
+                opacity: searching ? 0.6 : 1,
+                cursor: searching ? "not-allowed" : "pointer",
+              }}
             >
               <svg
                 width="20"
@@ -2126,7 +2143,7 @@ function HomePage({
                 color: "#f74f5e",
                 boxShadow: "0 4px 16px rgba(247,79,94,0.15)",
               }}
-              onClick={onCreateRoom}
+              onClick={handleCreateRoomClick}
             >
               <svg
                 width="18"
@@ -2378,8 +2395,8 @@ function HomePage({
       )}
       {showRules && <RulesModal onClose={() => setShowRules(false)} />}
 
-      {/* Matchmaking toast */}
-      {matchToast && (
+      {/* Matchmaking toast (đang tìm trận / hủy tìm trận) */}
+      {searching && (
         <div
           className="toast fixed bottom-8 left-1/2 -translate-x-1/2 px-6 py-3.5 rounded-xl flex items-center gap-3 z-30"
           style={{
@@ -2391,8 +2408,41 @@ function HomePage({
         >
           <div className="w-4 h-4 rounded-full border-2 border-blue-400 border-t-transparent animate-spin" />
           <span className="text-sm font-medium" style={{ color: "#4f8ef7" }}>
-            {matchToast}
+            {searchState === "cancelling"
+              ? "Đang hủy tìm trận..."
+              : `🔍 Đang tìm đối thủ · Bàn ${searchLabel}...`}
           </span>
+          {searchState !== "cancelling" && (
+            <button
+              onClick={handleCancelSearch}
+              className="ml-1 px-3 py-1 rounded-lg text-xs font-semibold transition-all hover:scale-105"
+              style={{
+                background: "rgba(247,79,94,0.15)",
+                border: "1px solid rgba(247,79,94,0.4)",
+                color: "#f74f5e",
+                fontFamily: "var(--font-mono)",
+              }}
+            >
+              HỦY
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Notice toast (thông báo chức năng đang phát triển, lỗi ghép trận...) */}
+      {notice && (
+        <div
+          className="toast fixed bottom-24 left-1/2 -translate-x-1/2 px-5 py-3 rounded-xl text-sm font-medium z-30"
+          style={{
+            background: "rgba(13,16,35,0.95)",
+            border: "1px solid rgba(247,192,79,0.4)",
+            color: "#f7c04f",
+            backdropFilter: "blur(8px)",
+            boxShadow: "0 8px 24px rgba(247,192,79,0.15)",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {notice}
         </div>
       )}
 
@@ -2408,8 +2458,13 @@ type SizeFilter = BoardSize | "any"
 export default function App() {
   const [page, setPage] = useState<Page>("auth")
   const [user, setUser] = useState<UserProfile | null>(null)
-  const [selectedSize, setSelectedSize] = useState<SizeFilter>(4)
+  // Server hiện chỉ hỗ trợ bàn 3×3 nên mặc định chọn 3×3
+  const [selectedSize, setSelectedSize] = useState<SizeFilter>(SUPPORTED_BOARD_SIZE)
   const [wsStatus, setWsStatus] = useState<WsStatus>(wsService.getStatus())
+
+  // Trận đang chơi (do server ghép: MATCH_FOUND) và cờ tự tìm trận mới sau khi kết thúc ván
+  const [activeMatch, setActiveMatch] = useState<ActiveMatch | null>(null)
+  const [autoSearch, setAutoSearch] = useState(false)
 
   // ✅ Session của TAB hiện tại (sessionStorage): có user gắn với session → khôi phục
   const [savedSession] = useState<TabSession | null>(() => loadTabSession())
@@ -2478,6 +2533,30 @@ export default function App() {
     }
   }, [])
 
+  // ✅ Server ghép được trận → MATCH_FOUND: roomId;opponentUsername;opponentDisplayName;opponentRanking;role
+  // Xử lý ở cấp App để dù người chơi đang ở trang nào cũng được đưa vào trận
+  useEffect(() => {
+    const offMatch = wsService.subscribe((response) => {
+      if (response?.type !== "message") return
+      const msg = splitServerMessage(response.data)
+      if (!msg || msg.opcode !== OP.MATCH_FOUND) return
+
+      const info = parseMatchFound(msg.params)
+      if (!info) {
+        console.error("❌ Không đọc được MATCH_FOUND:", msg.params)
+        return
+      }
+      console.log("🎮 Match found:", info)
+      setActiveMatch({
+        ...info,
+        boardSize: SUPPORTED_BOARD_SIZE,
+        opponentRankTier: mapRankingToTier(info.opponentRanking) as RankTier,
+      })
+      setPage("game")
+    })
+    return offMatch
+  }, [])
+
   // ✅ Khi đã kết nối mà tab đang có session → lấy lại dữ liệu user và vào thẳng trang chủ
   useEffect(() => {
     if (!restoring || !savedSession) return
@@ -2520,20 +2599,31 @@ export default function App() {
     // Xoá session của tab và quay lại trang đăng nhập
     clearTabSession()
     setUser(null)
+    setActiveMatch(null)
     setPage("auth")
 
     console.log("✅ User logged out: " + username)
-  }
-
-  const handlePlayGame = () => {
-    setPage("game")
   }
 
   const handleCreateRoom = () => {
     setPage("create-room")
   }
 
-  const effectiveSize: BoardSize = selectedSize === "any" ? 4 : selectedSize
+  // Rời màn hình trận đấu (đã kết thúc hoặc đã thoát giữa trận)
+  const handleLeaveGame = () => {
+    setActiveMatch(null)
+    setPage("home")
+  }
+
+  // "Tìm trận mới" sau khi kết thúc ván: về trang chủ và tự bắt đầu tìm trận
+  const handlePlayAgain = () => {
+    setActiveMatch(null)
+    setAutoSearch(true)
+    setPage("home")
+  }
+
+  const roomDefaultSize: BoardSize =
+    selectedSize === "any" ? SUPPORTED_BOARD_SIZE : selectedSize
 
   if (restoring)
     return (
@@ -2552,24 +2642,22 @@ export default function App() {
 
   if (page === "auth") return <AuthPage onLogin={handleLogin} wsStatus={wsStatus} />
   if (!user) return null
-  if (page === "game")
+  if (page === "game" && activeMatch)
     return (
       <GamePage
-        boardSize={effectiveSize}
+        key={activeMatch.roomId}
+        match={activeMatch}
         user={user}
-        onBack={() => setPage("home")}
+        onBack={handleLeaveGame}
+        onPlayAgain={handlePlayAgain}
       />
     )
   if (page === "create-room")
     return (
       <CreateRoomPage
         user={user}
-        defaultSize={effectiveSize}
+        defaultSize={roomDefaultSize}
         onBack={() => setPage("home")}
-        onStart={(size) => {
-          setSelectedSize(size)
-          setPage("game")
-        }}
       />
     )
   return (
@@ -2578,9 +2666,10 @@ export default function App() {
       onNavigate={setPage}
       selectedSize={selectedSize}
       onSizeChange={setSelectedSize}
-      onPlayGame={handlePlayGame}
       onCreateRoom={handleCreateRoom}
       onLogout={handleLogout}
+      autoSearch={autoSearch}
+      onAutoSearchHandled={() => setAutoSearch(false)}
     />
   )
 }
