@@ -16,6 +16,7 @@ import {
   type EdgeRef,
   type GameOverMsg,
   type MoveResultMsg,
+  type RestoreMatchMsg,
 } from './services/protocol'
 
 // ─── Game Types ───────────────────────────────────────────────────────────────
@@ -303,6 +304,36 @@ function GameOverOverlay({ result, onPlayAgain, onHome }: {
   )
 }
 
+// Khôi phục bảng từ snapshot server; 0 là mình, 1 là đối thủ.
+function buildStateFromSnapshot(snap: RestoreMatchMsg, myRole: 1 | 2): GameState {
+  const state = initGame(snap.boardSize, myRole)
+  const n = state.n
+  for (const [r1, c1, r2, c2] of snap.edges) {
+    const edge = dotsToEdge(r1, c1, r2, c2)
+    if (!edge) continue
+    if (edge.type === 'h' && edge.r >= 0 && edge.r <= n && edge.c >= 0 && edge.c < n) {
+      state.h[edge.r][edge.c] = true
+    } else if (edge.type === 'v' && edge.r >= 0 && edge.r < n && edge.c >= 0 && edge.c <= n) {
+      state.v[edge.r][edge.c] = true
+    }
+  }
+  for (const { r, c, ownerId } of snap.boxes) {
+    if (r < 0 || r >= n || c < 0 || c >= n) continue
+    // p1UserId đủ để phân biệt player1/player2 khi ownerId là userId hợp lệ.
+    const side: 0 | 1 = ownerId === snap.p1UserId
+      ? (myRole === 1 ? 0 : 1)
+      : (myRole === 2 ? 0 : 1)
+    if (ownerId > 0) state.boxes[r][c] = side
+  }
+  state.scores = myRole === 1 ? [snap.p1Score, snap.p2Score] : [snap.p2Score, snap.p1Score]
+  if (snap.nextTurn >= 0) {
+    state.turn = snap.nextTurn === snap.p1UserId
+      ? (myRole === 1 ? 0 : 1)
+      : (myRole === 2 ? 0 : 1)
+  }
+  return state
+}
+
 // ─── GamePage ─────────────────────────────────────────────────────────────────
 
 interface GamePageProps {
@@ -310,16 +341,17 @@ interface GamePageProps {
   user: UserProfile
   onBack: () => void
   onPlayAgain: () => void
+  initialSnapshot?: RestoreMatchMsg
 }
 
 type Timer = ReturnType<typeof setTimeout>
 
-export default function GamePage({ match, user, onBack, onPlayAgain }: GamePageProps) {
+export default function GamePage({ match, user, onBack, onPlayAgain, initialSnapshot }: GamePageProps) {
   const boardSize = match.boardSize
   const myRole = match.role
   const opponentName = match.opponentDisplayName || match.opponentUsername
 
-  const [state, setState] = useState<GameState>(() => initGame(boardSize, myRole))
+  const [state, setState] = useState<GameState>(() => initialSnapshot ? buildStateFromSnapshot(initialSnapshot, myRole) : initGame(boardSize, myRole))
   const [result, setResult] = useState<GameResult | null>(null)
   const [pending, setPending] = useState(false)        // đã gửi MAKE_MOVE, đang chờ server phản hồi
   const [leaving, setLeaving] = useState(false)        // đã gửi SURRENDER, đang chờ server
@@ -329,11 +361,13 @@ export default function GamePage({ match, user, onBack, onPlayAgain }: GamePageP
 
   // Server gửi playedBy/nextTurn/winnerId là USER ID, không kèm role → suy ra id của người chơi 1
   // từ nước đi đầu tiên (người chơi 1 luôn đi trước).
-  const p1IdRef = useRef<number | null>(null)
+  const p1IdRef = useRef<number | null>(initialSnapshot?.p1UserId ?? null)
   const endedRef = useRef(false)
   const iSurrenderedRef = useRef(false)
   const gameOverRef = useRef<GameOverMsg | null>(null)
-  const scoresRef = useRef<[number, number]>([0, 0])
+  const scoresRef = useRef<[number, number]>(initialSnapshot
+    ? (myRole === 1 ? [initialSnapshot.p1Score, initialSnapshot.p2Score] : [initialSnapshot.p2Score, initialSnapshot.p1Score])
+    : [0, 0])
   const pendingTimer = useRef<Timer | null>(null)
   const finishTimer = useRef<Timer | null>(null)
   const leaveTimer = useRef<Timer | null>(null)

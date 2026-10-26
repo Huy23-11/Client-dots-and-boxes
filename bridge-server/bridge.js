@@ -47,6 +47,7 @@ wss.on('connection', (ws) => {
 
   let tcpSocket = null;
   let connected = false;
+  let pingInterval = null;
 
   // ─────────────────────────────────────────────────────────────
   // 1️⃣  Connect to Java Server
@@ -63,6 +64,7 @@ wss.on('connection', (ws) => {
         type: 'connected',
         message: 'Kết nối tới server thành công'
       }));
+      
     }
   );
 
@@ -108,6 +110,20 @@ wss.on('connection', (ws) => {
       if (pending.length < frameSize) break; // chưa đủ frame, chờ thêm dữ liệu
 
       const message = pending.slice(16, frameSize).toString('utf-8');
+      // Bắt đầu ping khi login/attach thành công (tức đã có UserRepresentative trên server)
+      if (!pingInterval &&
+          (message.startsWith('REPLY_LOGIN,,LOGIN_SUCCESS') ||
+          message.startsWith('REPLY_ATTACH,,ATTACH_SUCCESS'))) {
+        pingInterval = setInterval(() => {
+          if (connected) tcpSocket.write(encodeFrame('PING,,'));
+        }, 5000);
+      }
+
+      // Dừng ping khi logout (không còn representative để giữ sống nữa)
+      if (pingInterval && message.startsWith('REPLY_LOGOUT,,')) {
+        clearInterval(pingInterval);
+        pingInterval = null;
+      }
       pending = pending.slice(frameSize);
 
       console.log(`\n📥 SERVER → BRIDGE → BROWSER:\n   "${message}"`);
@@ -128,11 +144,19 @@ wss.on('connection', (ws) => {
       message: 'Kết nối server bị lỗi'
     }));
     connected = false;
+    if (pingInterval) {            // ← MỚI
+      clearInterval(pingInterval);
+      pingInterval = null;
+    }
   });
 
   tcpSocket.on('close', () => {
     console.log('\n🔌 TCP connection closed');
     connected = false;
+    if (pingInterval) {            // ← MỚI
+      clearInterval(pingInterval);
+      pingInterval = null;
+    }
     ws.send(JSON.stringify({
       type: 'disconnected'
     }));

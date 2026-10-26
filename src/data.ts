@@ -33,6 +33,7 @@ export interface OfflinePlayer {
 }
 
 export interface LeaderboardEntry {
+  userId?: number
   rank: number
   username: string
   flag: string

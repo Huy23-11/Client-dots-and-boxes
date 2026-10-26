@@ -15,6 +15,7 @@ import {
   type BoardSize,
   type RankTier,
   type UserProfile,
+  type LeaderboardEntry,
 } from "./data"
 
 // ✅ WebSocket Service (singleton dùng chung cho toàn bộ app) — xem src/services/websocket.ts
@@ -24,10 +25,15 @@ import {
   OP,
   SUPPORTED_BOARD_SIZE,
   splitServerMessage,
+  parseLeaderboard,
   parseMatchFound,
   msgJoinQuickMatch,
   msgCancelQuickMatch,
   type ActiveMatch,
+  parseRestoreMatch,
+  type RestoreMatchMsg,
+  parseUsersList,
+  type ServerUser,
 } from "./services/protocol"
 
 // ─── Tab Session (sessionStorage: mỗi tab một phiên riêng) ────────────────────
@@ -97,13 +103,12 @@ function parseUserDetail(params: string): any {
 }
 
 // Convert ranking points to rank tier
-const mapRankingToTier = (ranking: number): string => {
-  if (ranking >= 2000) return "Huyền thoại"
-  if (ranking >= 1800) return "Kim cương"
+const mapRankingToTier = (ranking: number): RankTier => {
+  if (ranking >= 2000) return "Thách Đấu"
+  if (ranking >= 1800) return "Kim Cương"
   if (ranking >= 1600) return "Vàng"
   if (ranking >= 1400) return "Bạc"
-  if (ranking >= 1200) return "Đồng"
-  return "Sắt"
+  return "Đồng"
 }
 
 // Map database fields → UserProfile (an toàn khi thiếu field)
@@ -1080,10 +1085,6 @@ function SettingsModal({
 
 // ─── Auth Page ────────────────────────────────────────────────────────────────
 
-const VALID_ACCOUNTS = [
-  { username: "QuangHuy99", password: "123456" },
-  { username: "admin", password: "admin" },
-]
 
 function AuthPage({
   onLogin,
@@ -1620,6 +1621,13 @@ function HomePage({
 }) {
   const [showProfile, setShowProfile] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [usersLoading, setUsersLoading] = useState(true)
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([])
+  const [leaderboardLoading, setLeaderboardLoading] = useState(true)
+  const [serverUsers, setServerUsers] = useState<ServerUser[]>([])
+ 
+  // Chặn gửi request lặp khi effect được chạy lại ở môi trường dev
+  const leaderboardRequestedRef = useRef(false)
   const [showRules, setShowRules] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
 
@@ -1629,6 +1637,7 @@ function HomePage({
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const autoStartedRef = useRef(false)
+  const usersRequestedRef = useRef(false)
 
   const updateSearch = (s: SearchState) => {
     searchRef.current = s
@@ -1657,6 +1666,36 @@ function HomePage({
       if (!msg) return
 
       switch (msg.opcode) {
+
+        case OP.REPLY_LEADERBOARD: {
+          const rows = parseLeaderboard(msg.params)
+
+          const entries: LeaderboardEntry[] = rows.map((row) => ({
+            userId: row.userId,
+            rank: row.rank,
+            username: row.username,
+            flag: "",
+            rankTier: mapRankingToTier(row.ranking),
+            wins: row.totalWins,
+            rankPoints: row.ranking,
+            isSelf: row.username === user.username,
+          }))
+
+          setLeaderboard(entries)
+          setLeaderboardLoading(false)
+          break
+        }
+
+        case OP.REPLY_USERS_AVAILABLE_LIST: {
+          const users = parseUsersList(msg.params)
+
+          console.log("[USERS] Received:", users)
+
+          setServerUsers(users)
+          setUsersLoading(false)
+          break
+        }
+
         case OP.MATCH_FOUND:
           // Người ghép thứ hai nhận MATCH_FOUND TRƯỚC REPLY_JOIN_QUICK_MATCH → về idle để bỏ qua reply muộn
           clearSearchTimer()
@@ -1686,12 +1725,46 @@ function HomePage({
         }
       }
     })
+    // Đăng ký listener xong mới gửi yêu cầu lấy Top 7
+    if (
+      !leaderboardRequestedRef.current &&
+      wsService.getStatus() === "connected"
+    ) {
+      leaderboardRequestedRef.current = true
+      wsService.sendMessage(`${OP.GET_LEADERBOARD},,`)
+    }
+
+    if (
+      !usersRequestedRef.current &&
+      wsService.getStatus() === "connected"
+    ) {
+      usersRequestedRef.current = true
+      wsService.sendMessage(`${OP.GET_USERS_AVAILABLE_LIST},,`)
+    }
+
     return () => {
       unsubscribe()
       clearSearchTimer()
       if (noticeTimer.current) clearTimeout(noticeTimer.current)
     }
   }, [])
+
+  // TEST: yêu cầu Top 7 từ Java server
+  useEffect(() => {
+    const unsubscribe = wsService.subscribe((response) => {
+      if (response?.type !== "message") return;
+
+      const msg = splitServerMessage(response.data);
+      if (!msg || msg.opcode !== "REPLY_LEADERBOARD") return;
+
+      console.log("[TEST] Top 7 nhận từ backend:", msg.params);
+    });
+
+    // Gửi yêu cầu sau khi người dùng đã đăng nhập và vào HomePage
+    wsService.sendMessage("GET_LEADERBOARD,,");
+
+    return unsubscribe;
+  }, []);
 
   // ✅ CHƠI NHANH → gửi JOIN_QUICK_MATCH, chờ server ghép
   const handleQuickPlay = () => {
@@ -1701,10 +1774,11 @@ function HomePage({
       return
     }
 
-    // Server hiện chỉ có bàn 3×3 nên "Tất cả kích thước" cũng ghép vào bàn 3×3
-    const size = selectedSize === "any" ? SUPPORTED_BOARD_SIZE : selectedSize
+    // Gửi đúng lựa chọn: ANY hoặc 3x3 / 4x4 / 5x5.
+    // msgJoinQuickMatch sẽ serialize đúng format server đang yêu cầu.
+    console.log("[CLIENT] JOIN_QUICK_MATCH requested size:", selectedSize)
     updateSearch("joining")
-    wsService.sendMessage(msgJoinQuickMatch(size))
+    wsService.sendMessage(msgJoinQuickMatch(selectedSize))
 
     clearSearchTimer()
     searchTimer.current = setTimeout(() => {
@@ -1735,14 +1809,8 @@ function HomePage({
     handleQuickPlay()
   }, [])
 
-  // Server mới hỗ trợ bàn 3×3: 4×4 và 5×5 vẫn hiển thị nhưng chưa cho chọn
+  // Cho phép chọn đủ 3x3, 4x4, 5x5.
   const handleSizeClick = (n: BoardSize) => {
-    if (n !== SUPPORTED_BOARD_SIZE) {
-      showNotice(
-        `🚧 Bàn ${n}×${n} đang được phát triển — hiện chỉ hỗ trợ bàn ${SUPPORTED_BOARD_SIZE}×${SUPPORTED_BOARD_SIZE}`
-      )
-      return
-    }
     onSizeChange(n)
   }
 
@@ -1759,8 +1827,21 @@ function HomePage({
   const searchLabel =
     selectedSize === "any" ? "Tất cả kích thước" : `${selectedSize}×${selectedSize}`
 
-  const idlePlayers = ONLINE_PLAYERS.filter((p) => p.status === "idle")
-  const playingPlayers = ONLINE_PLAYERS.filter((p) => p.status === "playing")
+  const otherUsers = serverUsers.filter(
+    (p) => p.username !== user.username
+  )
+
+  const idlePlayers = otherUsers.filter(
+    (p) => p.status === "online" || p.status === "queuing"
+  )
+
+  const playingPlayers = otherUsers.filter(
+    (p) => p.status === "ingame"
+  )
+
+  const offlinePlayers = otherUsers.filter(
+    (p) => p.status === "offline"
+  )
 
   return (
     <div className="dot-grid min-h-screen flex flex-col relative overflow-hidden">
@@ -2014,10 +2095,18 @@ function HomePage({
             >
               🏆 Bảng xếp hạng
             </p>
-            <div className="space-y-1">
-              {LEADERBOARD.map((entry) => (
+            {leaderboardLoading ? (
+              <p className="text-xs text-white/40 px-2 py-3">
+                Đang tải bảng xếp hạng...
+              </p>
+            ) : leaderboard.length === 0 ? (
+              <p className="text-xs text-white/40 px-2 py-3">
+                Chưa có dữ liệu xếp hạng.
+              </p>
+            ) : (
+              leaderboard.map((entry) => (
                 <div
-                  key={entry.rank}
+                  key={entry.userId ?? entry.rank}
                   className="flex items-center gap-2 px-2 py-2 rounded-lg"
                   style={{
                     background: entry.isSelf
@@ -2047,6 +2136,7 @@ function HomePage({
                       ? ["🥇", "🥈", "🥉"][entry.rank - 1]
                       : entry.rank}
                   </span>
+
                   <div className="flex-1 min-w-0">
                     <p
                       className="text-xs font-medium truncate"
@@ -2056,19 +2146,22 @@ function HomePage({
                           : "rgba(255,255,255,0.8)",
                       }}
                     >
-                      {entry.flag} {entry.username}{" "}
-                      {entry.isSelf ? "(bạn)" : ""}
+                      {entry.username} {entry.isSelf ? "(bạn)" : ""}
                     </p>
+
                     <p
                       className={`text-xs ${rankClass(entry.rankTier)}`}
-                      style={{ fontFamily: "var(--font-mono)", fontSize: 9 }}
+                      style={{
+                        fontFamily: "var(--font-mono)",
+                        fontSize: 9,
+                      }}
                     >
                       {rankIcon(entry.rankTier)} {entry.wins} thắng
                     </p>
                   </div>
                 </div>
-              ))}
-            </div>
+              ))
+            )}
           </div>
         </aside>
 
@@ -2204,7 +2297,7 @@ function HomePage({
                     fontSize: 9,
                   }}
                 >
-                  ONLINE ({ONLINE_PLAYERS.length + 1})
+                  {idlePlayers.length + playingPlayers.length + 1}
                 </span>
               </div>
             </div>
@@ -2251,11 +2344,16 @@ function HomePage({
               >
                 <div
                   className="w-7 h-7 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold"
+                  // style={{
+                  //   background: `${rankColor(p.rankTier)}22`,
+                  //   border: `1.5px solid ${rankColor(p.rankTier)}55`,
+                  //   color: rankColor(p.rankTier),
+                  //   fontFamily: "var(--font-display)",
+                  // }}
                   style={{
-                    background: `${rankColor(p.rankTier)}22`,
-                    border: `1.5px solid ${rankColor(p.rankTier)}55`,
-                    color: rankColor(p.rankTier),
-                    fontFamily: "var(--font-display)",
+                    background: "rgba(99, 102, 241, 0.12)",
+                    border: "1.5px solid rgba(99, 102, 241, 0.35)",
+                    color: "#818cf8",
                   }}
                 >
                   {p.username[0]}
@@ -2265,7 +2363,7 @@ function HomePage({
                     className="text-xs truncate"
                     style={{ color: "rgba(255,255,255,0.8)" }}
                   >
-                    {p.flag} {p.username}
+                    {p.displayName || p.username}
                   </p>
                   <p
                     className="text-xs"
@@ -2288,11 +2386,16 @@ function HomePage({
               >
                 <div
                   className="w-7 h-7 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold"
+                  // style={{
+                  //   background: `${rankColor(p.rankTier)}22`,
+                  //   border: `1.5px solid ${rankColor(p.rankTier)}55`,
+                  //   color: rankColor(p.rankTier),
+                  //   fontFamily: "var(--font-display)",
+                  // }}
                   style={{
-                    background: `${rankColor(p.rankTier)}22`,
-                    border: `1.5px solid ${rankColor(p.rankTier)}55`,
-                    color: rankColor(p.rankTier),
-                    fontFamily: "var(--font-display)",
+                    background: "rgba(99, 102, 241, 0.12)",
+                    border: "1.5px solid rgba(99, 102, 241, 0.35)",
+                    color: "#818cf8",
                   }}
                 >
                   {p.username[0]}
@@ -2302,7 +2405,7 @@ function HomePage({
                     className="text-xs truncate"
                     style={{ color: "rgba(255,255,255,0.8)" }}
                   >
-                    {p.flag} {p.username}
+                    {p.displayName || p.username}
                   </p>
                   <p
                     className="text-xs"
@@ -2338,11 +2441,11 @@ function HomePage({
                   fontSize: 9,
                 }}
               >
-                NGOẠI TUYẾN ({OFFLINE_PLAYERS.length})
+                NGOẠI TUYẾN ({offlinePlayers.length})
               </span>
             </div>
 
-            {OFFLINE_PLAYERS.map((p) => (
+            {offlinePlayers.map((p) => (
               <div
                 key={p.username}
                 className="mx-2 mb-0.5 flex items-center gap-2 px-2 py-2 rounded-lg"
@@ -2363,7 +2466,7 @@ function HomePage({
                     className="text-xs truncate"
                     style={{ color: "rgba(255,255,255,0.35)" }}
                   >
-                    {p.flag} {p.username}
+                    {p.displayName || p.username}
                   </p>
                   <p
                     className="text-xs"
@@ -2373,7 +2476,7 @@ function HomePage({
                       fontSize: 9,
                     }}
                   >
-                    {p.lastSeen}
+                    Ngoại tuyến
                   </p>
                 </div>
               </div>
@@ -2458,19 +2561,21 @@ type SizeFilter = BoardSize | "any"
 export default function App() {
   const [page, setPage] = useState<Page>("auth")
   const [user, setUser] = useState<UserProfile | null>(null)
-  // Server hiện chỉ hỗ trợ bàn 3×3 nên mặc định chọn 3×3
+  // Mặc định chọn 3×3; người chơi có thể chọn 4×4, 5×5 hoặc ANY
   const [selectedSize, setSelectedSize] = useState<SizeFilter>(SUPPORTED_BOARD_SIZE)
   const [wsStatus, setWsStatus] = useState<WsStatus>(wsService.getStatus())
 
   // Trận đang chơi (do server ghép: MATCH_FOUND) và cờ tự tìm trận mới sau khi kết thúc ván
   const [activeMatch, setActiveMatch] = useState<ActiveMatch | null>(null)
+  const [restoreSnapshot, setRestoreSnapshot] = useState<RestoreMatchMsg | null>(null)
+  const restoreSnapshotRef = useRef<RestoreMatchMsg | null>(null)
   const [autoSearch, setAutoSearch] = useState(false)
 
   // ✅ Session của TAB hiện tại (sessionStorage): có user gắn với session → khôi phục
   const [savedSession] = useState<TabSession | null>(() => loadTabSession())
   const [restoring, setRestoring] = useState<boolean>(savedSession !== null)
   const restoringRef = useRef<boolean>(savedSession !== null)
-
+  const attachAcceptedRef = useRef(false)
   const endRestore = () => {
     restoringRef.current = false
     setRestoring(false)
@@ -2478,6 +2583,8 @@ export default function App() {
 
   const failRestore = () => {
     clearTabSession()
+    restoreSnapshotRef.current = null
+    setRestoreSnapshot(null)
     endRestore()
   }
 
@@ -2500,13 +2607,16 @@ export default function App() {
       // Attach thành công → lấy dữ liệu user
       if (opcode === "REPLY_ATTACH") {
         if (params.trim() === "ATTACH_SUCCESS") {
-          wsService.sendMessage(`GET_USER_DETAIL,,${savedSession.username}`)
+          attachAcceptedRef.current = true
+
+          wsService.sendMessage(
+            `GET_USER_DETAIL,,${savedSession.username}`
+          )
         } else {
           failRestore()
         }
         return
       }
-
       if (!USER_DATA_OPCODES.includes(opcode)) return
       try {
         const profile = buildUserProfile(
@@ -2515,7 +2625,7 @@ export default function App() {
         )
         console.log("♻️ Session restored for:", profile.username)
         setUser(profile)
-        setPage("home")
+        setPage(restoreSnapshotRef.current ? "game" : "home")
         endRestore()
       } catch (error) {
         console.error("❌ Failed to restore session:", error)
@@ -2547,46 +2657,117 @@ export default function App() {
         return
       }
       console.log("🎮 Match found:", info)
+      restoreSnapshotRef.current = null
+      setRestoreSnapshot(null)
       setActiveMatch({
         ...info,
-        boardSize: SUPPORTED_BOARD_SIZE,
+        // Dùng kích thước thực do server gửi trong MATCH_FOUND.
+        boardSize: info.boardSize,
         opponentRankTier: mapRankingToTier(info.opponentRanking) as RankTier,
       })
       setPage("game")
     })
     return offMatch
   }, [])
+  useEffect(() => {
+    const off = wsService.subscribe((response) => {
+      if (response?.type !== "message") return
+      const msg = splitServerMessage(response.data)
+      if (!msg || msg.opcode !== "RESTORE_MATCH") return
 
+      const info = parseRestoreMatch(msg.params)
+      if (!info) return
+
+      restoreSnapshotRef.current = info
+      setRestoreSnapshot(info)
+      setActiveMatch({
+        roomId: info.roomId,
+        opponentUsername: info.opponentUsername,
+        opponentDisplayName: info.opponentDisplayName,
+        opponentRanking: 0, // hoặc gọi thêm GET_USER_DETAIL nếu cần hiển thị rank
+        role: info.role,
+        boardSize: info.boardSize,
+        opponentRankTier: mapRankingToTier(0) as RankTier, // server chưa gửi rank đối thủ
+      })
+      setPage("game")
+    })
+    return off
+  }, [])
+  
   // ✅ Khi đã kết nối mà tab đang có session → lấy lại dữ liệu user và vào thẳng trang chủ
   useEffect(() => {
     if (!restoring || !savedSession) return
 
-    if (wsStatus === "error") {
-      // Không kết nối được server: hiện trang đăng nhập, giữ session để thử lại sau
-      endRestore()
-      return
-    }
+    // Không gửi attach khi WebSocket chưa kết nối.
+    // Giữ trạng thái restoring để chờ kết nối thay vì quay về Login.
     if (wsStatus !== "connected") return
 
-    console.log("📤 Attaching session:", savedSession.sessionId)
-    wsService.sendMessage(`ATTACH_REQUEST,,${savedSession.sessionId}`)
+    attachAcceptedRef.current = false
 
-    const timeout = setTimeout(() => {
+    let attempts = 0
+
+    const sendAttach = () => {
+      if (!restoringRef.current || attachAcceptedRef.current) {
+        return
+      }
+
+      if (wsService.getStatus() !== "connected") {
+        return
+      }
+
+      attempts += 1
+
+      console.log(
+        `📤 Attaching session attempt ${attempts}:`,
+        savedSession.sessionId
+      )
+
+      wsService.sendMessage(
+        `ATTACH_REQUEST,,${savedSession.sessionId}`
+      )
+    }
+
+    // Thử lần đầu sau một khoảng ngắn để bridge khởi tạo TCP.
+    const firstAttempt = window.setTimeout(sendAttach, 500)
+
+    // Nếu bridge báo chưa kết nối tới Java Server,
+    // thử lại cho đến khi attach thành công hoặc hết thời gian.
+    const retryInterval = window.setInterval(sendAttach, 1000)
+
+    const timeout = window.setTimeout(() => {
       if (restoringRef.current) {
         console.warn("⚠️ Session restore timed out")
         failRestore()
       }
-    }, 5000)
-    return () => clearTimeout(timeout)
+    }, 15000)
+
+    return () => {
+      window.clearTimeout(firstAttempt)
+      window.clearInterval(retryInterval)
+      window.clearTimeout(timeout)
+    }
   }, [wsStatus, restoring])
 
-  const handleLogin = (u: UserProfile, serverSessionId: string | null) => {
-    // ✅ gắn session id (do server cấp) của tab với user
-    if (serverSessionId) saveTabSession(u.username, serverSessionId)
-    else clearTabSession()
+  const handleLogin = (
+    u: UserProfile,
+    serverSessionId: string | null
+  ) => {
+    if (serverSessionId) {
+      saveTabSession(u.username, serverSessionId)
+    } else {
+      clearTabSession()
+    }
+
     setUser(u)
-    setTimeout(() => setPage("home"), 300)
-  }
+
+    // Có snapshot trận đấu thì ưu tiên vào GamePage.
+    // Không dùng setTimeout chuyển về Home nữa.
+    if (restoreSnapshotRef.current !== null) {
+      setPage("game")
+    } else {
+      setPage("home")
+    }
+  }   
 
   // ✅ Handle logout - send LOGOUT opcode to server
   const handleLogout = (username: string) => {
@@ -2600,6 +2781,8 @@ export default function App() {
     clearTabSession()
     setUser(null)
     setActiveMatch(null)
+    restoreSnapshotRef.current = null
+    setRestoreSnapshot(null)
     setPage("auth")
 
     console.log("✅ User logged out: " + username)
@@ -2612,12 +2795,16 @@ export default function App() {
   // Rời màn hình trận đấu (đã kết thúc hoặc đã thoát giữa trận)
   const handleLeaveGame = () => {
     setActiveMatch(null)
+    restoreSnapshotRef.current = null
+    setRestoreSnapshot(null)
     setPage("home")
   }
 
   // "Tìm trận mới" sau khi kết thúc ván: về trang chủ và tự bắt đầu tìm trận
   const handlePlayAgain = () => {
     setActiveMatch(null)
+    restoreSnapshotRef.current = null
+    setRestoreSnapshot(null)
     setAutoSearch(true)
     setPage("home")
   }
@@ -2650,6 +2837,7 @@ export default function App() {
         user={user}
         onBack={handleLeaveGame}
         onPlayAgain={handlePlayAgain}
+        initialSnapshot={restoreSnapshot?.roomId === activeMatch.roomId ? restoreSnapshot : undefined}
       />
     )
   if (page === "create-room")

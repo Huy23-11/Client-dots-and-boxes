@@ -1,76 +1,86 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import type { BoardSize, UserProfile } from "./data"
+import { BOARD_SIZE_OPTIONS } from "./data"
 import {
-  BOARD_SIZE_OPTIONS,
-  ONLINE_PLAYERS,
-  OFFLINE_PLAYERS,
-  rankColor,
-  type OnlinePlayer,
-  type OfflinePlayer,
-} from "./data"
-import { SUPPORTED_BOARD_SIZE } from "./services/protocol"
+  OP,
+  SUPPORTED_BOARD_SIZE,
+  splitServerMessage,
+  parseUsersList,
+  type ServerUser,
+} from "./services/protocol"
+import { wsService } from "./services/websocket"
 
 // ─── Player Row ───────────────────────────────────────────────────────────────
 
 function PlayerRow({
   player,
-  isOffline,
   onInvite,
 }: {
-  player: OnlinePlayer | OfflinePlayer
-  isOffline: boolean
+  player: ServerUser
   onInvite?: () => void
 }) {
-  const rc = rankColor(player.rankTier)
-  const status = isOffline ? null : (player as OnlinePlayer).status
+  const isOffline = player.status === "offline"
+  const isPlaying = player.status === "ingame"
+  const isQueuing = player.status === "queuing"
+
+  const displayName = player.displayName?.trim() || player.username
+
+  const statusText = isOffline
+    ? "Ngoại tuyến"
+    : isPlaying
+      ? "Đang chơi"
+      : isQueuing
+        ? "Đang tìm trận"
+        : "Rảnh"
+
+  const statusColor = isOffline
+    ? "rgba(255,255,255,0.3)"
+    : isPlaying
+      ? "#f7c04f"
+      : "#4ade80"
+
+  const avatarColor = isOffline
+    ? "#64748b"
+    : isPlaying
+      ? "#f7c04f"
+      : "#4ade80"
 
   return (
     <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl transition-colors hover:bg-white/5">
-      {/* Avatar */}
       <div
         className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold"
         style={{
-          background: `${rc}20`,
-          border: `1.5px solid ${rc}55`,
-          color: rc,
+          background: `${avatarColor}20`,
+          border: `1.5px solid ${avatarColor}55`,
+          color: avatarColor,
           fontFamily: "var(--font-display)",
         }}
       >
-        {player.username[0]}
+        {displayName[0]?.toUpperCase() || "?"}
       </div>
 
-      {/* Info */}
       <div className="flex-1 min-w-0">
         <p
           className="text-xs font-semibold truncate"
           style={{ color: "rgba(255,255,255,0.85)" }}
         >
-          {player.flag} {player.username}
+          {displayName}
         </p>
+
         <p
           className="text-xs"
           style={{
             fontFamily: "var(--font-mono)",
             fontSize: 9,
-            color: isOffline
-              ? "rgba(255,255,255,0.25)"
-              : status === "idle"
-                ? "#4ade80"
-                : "#f7c04f",
+            color: statusColor,
           }}
         >
-          {isOffline
-            ? `○ ${(player as OfflinePlayer).lastSeen}`
-            : status === "idle"
-              ? "● Rảnh"
-              : "● Đang chơi"}
+          ● {statusText}
         </p>
       </div>
 
-      {/* Actions */}
       <div className="flex items-center gap-1">
-        {/* Invite (online+idle) */}
-        {!isOffline && status === "idle" && onInvite && (
+        {player.status === "online" && onInvite && (
           <button
             onClick={onInvite}
             className="text-xs px-2 py-1 rounded-lg font-semibold transition-all hover:scale-105"
@@ -103,13 +113,146 @@ export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
   const [roomName, setRoomName] = useState(`Phòng của ${user.username}`)
   const [toast, setToast] = useState<string | null>(null)
 
+  const [serverUsers, setServerUsers] = useState<ServerUser[]>([])
+  const [usersLoading, setUsersLoading] = useState(true)
+  const [roomCode, setRoomCode] = useState<string | null>(null)
+  const [creatingRoom, setCreatingRoom] = useState(false)
+
+  useEffect(() => {
+    // Đăng ký listener trước khi gửi yêu cầu
+    const unsubscribe = wsService.subscribe((response) => {
+      if (response?.type !== "message") return
+
+      const msg = splitServerMessage(response.data)
+
+      if (!msg || msg.opcode !== OP.REPLY_USERS_AVAILABLE_LIST) {
+        return
+      }
+
+      const users = parseUsersList(msg.params)
+
+      console.log("[CREATE ROOM] Users received:", users)
+
+      setServerUsers(users)
+      setUsersLoading(false)
+    })
+
+    // Yêu cầu danh sách khi mở Create Room
+    if (wsService.getStatus() === "connected") {
+      wsService.sendMessage(`${OP.GET_USERS_AVAILABLE_LIST},,`)
+    }
+
+    return () => {
+      unsubscribe()
+    }
+  }, [])
+
   const showToast = (msg: string) => {
     setToast(msg)
     setTimeout(() => setToast(null), 2500)
   }
+  useEffect(() => {
+    const unsubscribe = wsService.subscribe((response) => {
+      if (response?.type !== "message") return
 
-  const handleInvite = (p: OnlinePlayer) =>
-    showToast(`✅ Đã gửi lời mời đến ${p.username}!`)
+      const msg = splitServerMessage(response.data)
+            if (!msg) return
+
+            if (msg.opcode === OP.INVITED) {
+        const status = msg.params.trim()
+
+        if (status === "SUCCESS") {
+          showToast("Server đã gửi lời mời thành công.")
+        } else if (status === "USER_INGAME") {
+          showToast("Người chơi đang ở trong trận.")
+        } else if (status === "USER_UNAVAILABLE") {
+          showToast("Người chơi hiện không khả dụng.")
+        } else {
+          showToast(`Gửi lời mời thất bại: ${status}`)
+        }
+
+        return
+      }
+
+      if (msg.opcode === OP.REPLY_USERS_AVAILABLE_LIST) {
+        setServerUsers(parseUsersList(msg.params))
+        return
+      }
+
+      if (msg.opcode === OP.REPLY_SHARE_ROOM) {
+        const [status, code] = msg.params.split(";")
+        setCreatingRoom(false)
+
+        if (status === "SUCCESS" && code) {
+          setRoomCode(code)
+          showToast(`Tạo phòng thành công! Mã phòng: ${code}`)
+        } else if (status === "ALREADY_IN_QUEUE") {
+          showToast("Mày đang trong hàng đợi ghép trận.")
+        } else if (status === "ALREADY_BUSY") {
+          showToast("Mày đang bận hoặc đã ở trong phòng.")
+        } else {
+          showToast("Tạo phòng thất bại. Thử lại nhé.")
+        }
+      }
+    })
+
+    if (wsService.getStatus() === "connected") {
+      wsService.sendMessage(`${OP.GET_USERS_AVAILABLE_LIST},,`)
+    }
+
+    return () => {
+      unsubscribe()
+    }
+  }, [])
+
+  const handleInvite = (p: ServerUser) => {
+    if (wsService.getStatus() !== "connected") {
+      showToast("Chưa kết nối tới server.")
+      return
+    }
+
+    // Tìm ID của tài khoản đang đăng nhập từ dữ liệu server
+    const currentUser = serverUsers.find(
+      (u) => u.username === user.username
+    )
+
+    if (!currentUser) {
+      showToast("Chưa lấy được thông tin tài khoản. Thử lại nhé.")
+      wsService.sendMessage(`${OP.GET_USERS_AVAILABLE_LIST},,`)
+      return
+    }
+
+    if (p.status !== "online") {
+      showToast("Người chơi này hiện không thể nhận lời mời.")
+      return
+    }
+
+    const boardSize = `${size}x${size}`
+
+    console.log("[INVITE] Sending invitation:", {
+      senderId: currentUser.userId,
+      receiverId: p.userId,
+      boardSize,
+    })
+
+    wsService.sendMessage(
+      `${OP.INVITE},,${currentUser.userId};${p.userId};${boardSize}`
+    )
+
+    showToast(`Đang gửi lời mời tới ${p.username}...`)
+  }
+
+  const otherUsers = serverUsers.filter(
+    (p) => p.username !== user.username
+  )
+
+  const onlineUsers = otherUsers.filter(
+    (p) => p.status !== "offline"
+  )
+
+  const offlineUsers = otherUsers.filter(
+    (p) => p.status === "offline"
+  )
 
   // Server mới hỗ trợ bàn 3×3: 4×4 và 5×5 vẫn hiển thị nhưng chưa cho chọn
   const handleSizeClick = (n: BoardSize) => {
@@ -123,8 +266,39 @@ export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
   }
 
   // Server chưa có xử lý tạo phòng tùy chỉnh (CREATE_CUSTOM_ROOM) nên chưa bắt đầu được trận
-  const handleStart = () =>
-    showToast("🚧 Chức năng tạo phòng đang được phát triển")
+  const handleStart = () => {
+    if (wsService.getStatus() !== "connected") {
+      showToast("Chưa kết nối tới server.")
+      return
+    }
+
+    if (creatingRoom) {
+      return
+    }
+
+    if (roomCode) {
+      showToast(`Phòng đã được tạo. Mã phòng: ${roomCode}`)
+      return
+    }
+
+    const currentUser = serverUsers.find(
+      (p) => p.username === user.username
+    )
+
+    if (!currentUser) {
+      wsService.sendMessage(`${OP.GET_USERS_AVAILABLE_LIST},,`)
+      showToast("Chưa lấy được ID tài khoản. Thử lại sau một chút.")
+      return
+    }
+
+    const boardSize = `${size}x${size}`
+
+    setCreatingRoom(true)
+
+    wsService.sendMessage(
+      `${OP.SHARE_ROOM},,${currentUser.userId};${boardSize}`
+    )
+  }
 
   return (
     <div
@@ -257,9 +431,30 @@ export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
             <button
               className="btn-primary w-full py-3 text-base"
               onClick={handleStart}
+              disabled={creatingRoom || !!roomCode}
             >
-              ▶ BẮT ĐẦU PHÒNG
+              {creatingRoom
+                ? "ĐANG TẠO PHÒNG..."
+                : roomCode
+                  ? "PHÒNG ĐÃ TẠO"
+                  : "▶ BẮT ĐẦU PHÒNG"}
             </button>
+
+            {roomCode && (
+              <div className="mt-3 rounded-xl p-3 border border-blue-400/30 bg-blue-400/10">
+                <p className="text-xs text-blue-300 mb-1">
+                  MÃ PHÒNG CỦA MÀY
+                </p>
+
+                <p className="text-xl font-bold tracking-widest text-white">
+                  {roomCode}
+                </p>
+
+                <p className="text-xs text-white/50 mt-2">
+                  Chia sẻ mã này với người chơi khác để họ tham gia phòng.
+                </p>
+              </div>
+)}
           </div>
         </div>
 
@@ -297,19 +492,30 @@ export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
                     fontSize: 10,
                   }}
                 >
-                  ONLINE ({ONLINE_PLAYERS.length})
+                  ONLINE ({onlineUsers.length})
                 </span>
               </div>
-              {ONLINE_PLAYERS.map((p) => (
+              {usersLoading ? (
+              <p className="px-3 py-2 text-xs text-white/40">
+                Đang tải danh sách người chơi...
+              </p>
+            ) : onlineUsers.length === 0 ? (
+              <p className="px-3 py-2 text-xs text-white/40">
+                Không có người chơi trực tuyến
+              </p>
+            ) : (
+              onlineUsers.map((p) => (
                 <PlayerRow
-                  key={p.username}
+                  key={p.userId}
                   player={p}
-                  isOffline={false}
                   onInvite={
-                    p.status === "idle" ? () => handleInvite(p) : undefined
+                    p.status === "online"
+                      ? () => handleInvite(p)
+                      : undefined
                   }
                 />
-              ))}
+              ))
+            )}
             </div>
 
             {/* Offline section */}
@@ -330,11 +536,11 @@ export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
                     fontSize: 10,
                   }}
                 >
-                  NGOẠI TUYẾN ({OFFLINE_PLAYERS.length})
+                  NGOẠI TUYẾN ({offlineUsers.length})
                 </span>
               </div>
-              {OFFLINE_PLAYERS.map((p) => (
-                <PlayerRow key={p.username} player={p} isOffline={true} />
+              {offlineUsers.map((p) => (
+                <PlayerRow key={p.userId} player={p} />
               ))}
             </div>
           </div>
