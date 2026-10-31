@@ -156,9 +156,9 @@ export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
       if (response?.type !== "message") return
 
       const msg = splitServerMessage(response.data)
-            if (!msg) return
+      if (!msg) return
 
-            if (msg.opcode === OP.INVITED) {
+      if (msg.opcode === OP.INVITED) {
         const status = msg.params.trim()
 
         if (status === "SUCCESS") {
@@ -169,6 +169,20 @@ export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
           showToast("Người chơi hiện không khả dụng.")
         } else {
           showToast(`Gửi lời mời thất bại: ${status}`)
+        }
+
+        return
+      }
+
+      if (msg.opcode === OP.RESPONSE_INVITATION) {
+        const status = msg.params.trim()
+
+        if (status === "REJECTED") {
+          showToast("Người chơi đã từ chối lời mời.")
+        } else if (status === "ACCEPT") {
+          showToast("Người chơi đã chấp nhận. Đang tạo trận...")
+        } else if (status === "FAIL") {
+          showToast("Không thể tạo trận. Hãy kiểm tra trạng thái người chơi.")
         }
 
         return

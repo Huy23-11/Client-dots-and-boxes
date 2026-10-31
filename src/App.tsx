@@ -2,7 +2,6 @@ import { useState, useEffect, useRef } from "react"
 import GamePage from "./GamePage"
 import CreateRoomPage from "./CreateRoomPage"
 import {
-  MOCK_USER,
   ONLINE_PLAYERS,
   OFFLINE_PLAYERS,
   LEADERBOARD,
@@ -98,8 +97,15 @@ const USER_DATA_OPCODES = [
 function parseUserDetail(params: string): any {
   const trimmed = params.trim()
   if (trimmed.startsWith("{")) return JSON.parse(trimmed)
-  const [username, displayName, ranking, status] = params.split(";")
-  return { username, displayName, ranking: Number(ranking), status }
+  const [username, displayName, ranking, status, userId] =   params.split(";");
+
+  return {
+      username,
+      displayName,
+      ranking: Number(ranking),
+      status,
+      userId: Number(userId)
+  };
 }
 
 // Convert ranking points to rank tier
@@ -116,6 +122,8 @@ function buildUserProfile(userData: any, fallbackUsername: string): UserProfile 
   const username: string = userData?.username || fallbackUsername
   const displayName: string = userData?.displayName || username
   const ranking = Number(userData?.ranking) || 0
+  const userId = Number(userData?.userId)
+
   const initials =
     displayName
       .split(" ")
@@ -125,13 +133,14 @@ function buildUserProfile(userData: any, fallbackUsername: string): UserProfile 
       .toUpperCase() || username.slice(0, 2).toUpperCase()
 
   return {
+    userId,
     initials,
     username,
-    flag: "🇻🇳", // Default nếu không có trong DB
-    nationality: "Việt Nam", // Default nếu không có trong DB
+    flag: "🇻🇳",
+    nationality: "Việt Nam",
     rankTier: mapRankingToTier(ranking),
     rankPoints: ranking,
-    money: 50000, // Default nếu không có trong DB
+    money: 50000,
     gamesPlayed: userData?.totalMatches || 0,
     gamesWon: userData?.totalWins || 0,
   } as UserProfile
@@ -2557,6 +2566,11 @@ function HomePage({
 // ─── App (Router) ──────────────────────────────────────────────────────────────
 
 type SizeFilter = BoardSize | "any"
+type IncomingInvitation = {
+  senderId: number
+  senderName: string
+  boardSize: string
+}
 
 export default function App() {
   const [page, setPage] = useState<Page>("auth")
@@ -2564,7 +2578,9 @@ export default function App() {
   // Mặc định chọn 3×3; người chơi có thể chọn 4×4, 5×5 hoặc ANY
   const [selectedSize, setSelectedSize] = useState<SizeFilter>(SUPPORTED_BOARD_SIZE)
   const [wsStatus, setWsStatus] = useState<WsStatus>(wsService.getStatus())
-
+  const [incomingInvitation, setIncomingInvitation] = useState<IncomingInvitation | null>(null)
+  const [invitationResponding, setInvitationResponding] = useState(false)
+  const [invitationError, setInvitationError] = useState<string | null>(null)
   // Trận đang chơi (do server ghép: MATCH_FOUND) và cờ tự tìm trận mới sau khi kết thúc ván
   const [activeMatch, setActiveMatch] = useState<ActiveMatch | null>(null)
   const [restoreSnapshot, setRestoreSnapshot] = useState<RestoreMatchMsg | null>(null)
@@ -2643,6 +2659,54 @@ export default function App() {
     }
   }, [])
 
+  useEffect(() => {
+    const unsubscribe = wsService.subscribe((response) => {
+      if (response?.type !== "message") return
+
+      const msg = splitServerMessage(response.data)
+      if (!msg) return
+
+      if (msg.opcode === OP.INVITED_BY) {
+        const parts = msg.params.split(";")
+
+        if (parts.length < 3) {
+          console.error("Invalid INVITED_BY:", msg.params)
+          return
+        }
+
+        const senderId = Number(parts[0])
+        if (!Number.isInteger(senderId)) {
+          console.error("Invalid sender ID:", msg.params)
+          return
+        }
+
+        setInvitationError(null)
+        setInvitationResponding(false)
+        setIncomingInvitation({
+          senderId,
+          senderName: parts[1],
+          boardSize: parts[2],
+        })
+
+        return
+      }
+
+      if (msg.opcode === OP.REPLY_RESPONSE_INVITE) {
+        const status = msg.params.trim()
+        console.log("📩 Invitation processing result:", status)
+
+        if (status === "FAIL") {
+          setInvitationResponding(false)
+          setInvitationError(
+            "Server chưa thể tạo trận. Hãy thử lại hoặc kiểm tra trạng thái người chơi."
+          )
+        }
+      }
+    })
+
+    return unsubscribe
+  }, [])
+
   // ✅ Server ghép được trận → MATCH_FOUND: roomId;opponentUsername;opponentDisplayName;opponentRanking;role
   // Xử lý ở cấp App để dù người chơi đang ở trang nào cũng được đưa vào trận
   useEffect(() => {
@@ -2665,6 +2729,9 @@ export default function App() {
         boardSize: info.boardSize,
         opponentRankTier: mapRankingToTier(info.opponentRanking) as RankTier,
       })
+      setIncomingInvitation(null)
+      setInvitationResponding(false)
+      setInvitationError(null)
       setPage("game")
     })
     return offMatch
@@ -2689,6 +2756,9 @@ export default function App() {
         boardSize: info.boardSize,
         opponentRankTier: mapRankingToTier(0) as RankTier, // server chưa gửi rank đối thủ
       })
+      setIncomingInvitation(null)
+      setInvitationResponding(false)
+      setInvitationError(null)
       setPage("game")
     })
     return off
@@ -2763,6 +2833,9 @@ export default function App() {
     // Có snapshot trận đấu thì ưu tiên vào GamePage.
     // Không dùng setTimeout chuyển về Home nữa.
     if (restoreSnapshotRef.current !== null) {
+      setIncomingInvitation(null)
+      setInvitationResponding(false)
+      setInvitationError(null)
       setPage("game")
     } else {
       setPage("home")
@@ -2784,8 +2857,59 @@ export default function App() {
     restoreSnapshotRef.current = null
     setRestoreSnapshot(null)
     setPage("auth")
-
+    setIncomingInvitation(null)
+    setInvitationResponding(false)
+    setInvitationError(null)
     console.log("✅ User logged out: " + username)
+  }
+
+  const handleInvitationResponse = (accepted: boolean) => {
+    const invitation = incomingInvitation
+
+    if (!invitation || !user || invitationResponding) return
+
+    // Dùng userId của tài khoản, tuyệt đối không dùng sessionId.
+    const profile = user as UserProfile & {
+      userId?: number | string
+      id?: number | string
+    }
+
+    const currentUserId = Number(profile.userId ?? profile.id)
+
+    if (!Number.isInteger(currentUserId) || currentUserId <= 0) {
+      console.log("[INVITATION] user =", JSON.stringify(user, null, 2));
+      console.log("[INVITATION] user keys =", Object.keys(user ?? {}));
+      console.log("[INVITATION] currentUserId =", currentUserId);
+      console.error("Cannot determine current user ID:", user)
+      setInvitationError("Không xác định được tài khoản đang đăng nhập.")
+      return
+    }
+
+    if (wsService.getStatus() !== "connected") {
+      setInvitationError("Mất kết nối tới server. Hãy kết nối lại.")
+      return
+    }
+
+    const status = accepted ? "ACCEPT" : "REJECTED"
+
+    const message =
+      `RESPONSE_INVITE,,${currentUserId};` +
+      `${invitation.senderId};` +
+      `${invitation.boardSize};${status}`
+
+    console.log("📤 Sending invitation response:", message)
+    setInvitationError(null)
+
+    if (accepted) {
+      // Giữ popup lại trong lúc đợi server tạo trận.
+      setInvitationResponding(true)
+    } else {
+      // Từ chối thì đóng popup ngay.
+      setIncomingInvitation(null)
+      setInvitationResponding(false)
+    }
+
+    wsService.sendMessage(message)
   }
 
   const handleCreateRoom = () => {
@@ -2827,37 +2951,109 @@ export default function App() {
       </div>
     )
 
-  if (page === "auth") return <AuthPage onLogin={handleLogin} wsStatus={wsStatus} />
+  if (page === "auth")
+    return <AuthPage onLogin={handleLogin} wsStatus={wsStatus} />
+
   if (!user) return null
-  if (page === "game" && activeMatch)
-    return (
-      <GamePage
-        key={activeMatch.roomId}
-        match={activeMatch}
-        user={user}
-        onBack={handleLeaveGame}
-        onPlayAgain={handlePlayAgain}
-        initialSnapshot={restoreSnapshot?.roomId === activeMatch.roomId ? restoreSnapshot : undefined}
-      />
-    )
-  if (page === "create-room")
-    return (
-      <CreateRoomPage
-        user={user}
-        defaultSize={roomDefaultSize}
-        onBack={() => setPage("home")}
-      />
-    )
+
   return (
-    <HomePage
-      user={user}
-      onNavigate={setPage}
-      selectedSize={selectedSize}
-      onSizeChange={setSelectedSize}
-      onCreateRoom={handleCreateRoom}
-      onLogout={handleLogout}
-      autoSearch={autoSearch}
-      onAutoSearchHandled={() => setAutoSearch(false)}
-    />
+    <>
+      {page === "game" && activeMatch ? (
+        <GamePage
+          key={activeMatch.roomId}
+          match={activeMatch}
+          user={user}
+          onBack={handleLeaveGame}
+          onPlayAgain={handlePlayAgain}
+          initialSnapshot={
+            restoreSnapshot?.roomId === activeMatch.roomId
+              ? restoreSnapshot
+              : undefined
+          }
+        />
+      ) : page === "create-room" ? (
+        <CreateRoomPage
+          user={user}
+          defaultSize={roomDefaultSize}
+          onBack={() => setPage("home")}
+        />
+      ) : (
+        <HomePage
+          user={user}
+          onNavigate={setPage}
+          selectedSize={selectedSize}
+          onSizeChange={setSelectedSize}
+          onCreateRoom={handleCreateRoom}
+          onLogout={handleLogout}
+          autoSearch={autoSearch}
+          onAutoSearchHandled={() => setAutoSearch(false)}
+        />
+      )}
+
+      {/* POPUP NHẬN LỜI MỜI */}
+      {incomingInvitation && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="glass w-[420px] max-w-[92vw] rounded-2xl border border-blue-400/30 p-6 shadow-2xl">
+            <div className="mb-4 text-center">
+              <div className="mb-3 text-4xl">🎮</div>
+              <h2 className="text-xl font-bold text-white">
+                Lời mời chơi Dots & Boxes
+              </h2>
+              <p className="mt-2 text-sm text-gray-300">
+                Có người muốn thách đấu với bạn!
+              </p>
+            </div>
+
+            <div className="mb-5 rounded-xl bg-white/5 p-4">
+              <div className="mb-3 flex justify-between gap-3">
+                <span className="text-gray-400">Người mời</span>
+                <span className="font-semibold text-blue-300">
+                  {incomingInvitation.senderName}
+                </span>
+              </div>
+
+              <div className="flex justify-between gap-3">
+                <span className="text-gray-400">Kích thước bàn</span>
+                <span className="font-semibold text-white">
+                  {incomingInvitation.boardSize}
+                </span>
+              </div>
+            </div>
+
+            {invitationResponding && (
+              <p className="mb-3 text-center text-sm text-blue-300">
+                Đang chấp nhận lời mời, chờ server tạo trận...
+              </p>
+            )}
+
+            {invitationError && (
+              <p role="alert" className="mb-3 text-center text-sm text-red-300">
+                {invitationError}
+              </p>
+            )}
+
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                disabled={invitationResponding}
+                onClick={() => handleInvitationResponse(false)}
+                className="rounded-xl bg-red-500/20 px-4 py-3 font-semibold text-red-300 hover:bg-red-500/30 disabled:opacity-50"
+              >
+                Từ chối
+              </button>
+
+              <button
+                type="button"
+                disabled={invitationResponding}
+                onClick={() => handleInvitationResponse(true)}
+                className="rounded-xl bg-green-600 px-4 py-3 font-semibold text-white hover:bg-green-500 disabled:opacity-50"
+              >
+                {invitationResponding ? "Đang xử lý..." : "Chấp nhận"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   )
 }

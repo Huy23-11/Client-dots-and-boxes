@@ -6,6 +6,7 @@ export type RankTier = 'Đồng' | 'Bạc' | 'Vàng' | 'Bạch Kim' | 'Kim Cươ
 export type PlayerStatus = 'idle' | 'playing' | 'offline'
 
 export interface UserProfile {
+  userId: number
   username: string
   money: number
   rankPoints: number
@@ -70,18 +71,6 @@ export const BOARD_SIZE_OPTIONS: BoardSizeOption[] = [
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
-export const MOCK_USER: UserProfile = {
-  username: 'QuangHuy99',
-  money: 5250,
-  rankPoints: 3420,
-  rankTier: 'Bạch Kim',
-  nationality: 'Việt Nam',
-  flag: '🇻🇳',
-  gamesPlayed: 147,
-  gamesWon: 89,
-  initials: 'QH',
-  status: 'idle',
-}
 
 export const ONLINE_PLAYERS: OnlinePlayer[] = [
   { username: 'DragonMaster', status: 'idle',    rankTier: 'Kim Cương', flag: '🇻🇳' },
