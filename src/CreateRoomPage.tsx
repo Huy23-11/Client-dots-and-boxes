@@ -3,7 +3,6 @@ import type { BoardSize, UserProfile } from "./data"
 import { BOARD_SIZE_OPTIONS } from "./data"
 import {
   OP,
-  SUPPORTED_BOARD_SIZE,
   splitServerMessage,
   parseUsersList,
   type ServerUser,
@@ -268,14 +267,17 @@ export default function CreateRoomPage({ user, defaultSize, onBack }: Props) {
     (p) => p.status === "offline"
   )
 
-  // Server mới hỗ trợ bàn 3×3: 4×4 và 5×5 vẫn hiển thị nhưng chưa cho chọn
   const handleSizeClick = (n: BoardSize) => {
-    if (n !== SUPPORTED_BOARD_SIZE) {
-      showToast(
-        `🚧 Bàn ${n}×${n} đang được phát triển — hiện chỉ hỗ trợ bàn ${SUPPORTED_BOARD_SIZE}×${SUPPORTED_BOARD_SIZE}`
-      )
+    if (creatingRoom) {
+      showToast("Đang tạo phòng, vui lòng chờ.")
       return
     }
+
+    if (roomCode) {
+      showToast("Phòng đã được tạo. Không thể đổi kích thước.")
+      return
+    }
+
     setSize(n)
   }
 

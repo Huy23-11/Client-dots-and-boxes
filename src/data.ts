@@ -1,7 +1,12 @@
 // ─── Shared Types & Data ─────────────────────────────────────────────────────
 
 export type BoardSize = 3 | 4 | 5
-export type Page = 'auth' | 'home' | 'chat' | 'game' | 'create-room'
+export type Page =
+  | "auth"
+  | "home"
+  | "create-room"
+  | "find-room"
+  | "game"
 export type RankTier = 'Đồng' | 'Bạc' | 'Vàng' | 'Bạch Kim' | 'Kim Cương' | 'Thách Đấu'
 export type PlayerStatus = 'idle' | 'playing' | 'offline'
 

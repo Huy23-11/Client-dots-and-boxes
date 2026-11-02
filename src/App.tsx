@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react"
 import GamePage from "./GamePage"
 import CreateRoomPage from "./CreateRoomPage"
+import FindRoomPage from "./FindRoomPage"
 import {
   ONLINE_PLAYERS,
   OFFLINE_PLAYERS,
@@ -33,6 +34,9 @@ import {
   type RestoreMatchMsg,
   parseUsersList,
   type ServerUser,
+  msgGetMatchHistory,
+  parseMatchHistory,
+  type MatchHistoryEntry,
 } from "./services/protocol"
 
 // ─── Tab Session (sessionStorage: mỗi tab một phiên riêng) ────────────────────
@@ -96,16 +100,54 @@ const USER_DATA_OPCODES = [
 // Server trả: username;displayName;ranking;status (cũng chấp nhận JSON)
 function parseUserDetail(params: string): any {
   const trimmed = params.trim()
-  if (trimmed.startsWith("{")) return JSON.parse(trimmed)
-  const [username, displayName, ranking, status, userId] =   params.split(";");
+
+  if (trimmed.startsWith("{")) {
+    const parsed = JSON.parse(trimmed)
+
+    return {
+      ...parsed,
+      isInQuickMatchQueue:
+        parsed.isInQuickMatchQueue === true ||
+        String(parsed.isInQuickMatchQueue).toLowerCase() === "true",
+      queuedBoardSize: parsed.queuedBoardSize ?? "",
+      totalMatches: Number(parsed.totalMatches) || 0,
+      totalWins: Number(parsed.totalWins) || 0,
+    }
+  }
+
+  const [
+    username,
+    displayName,
+    ranking,
+    status,
+    userId,
+    isInQuickMatchQueue,
+    queuedBoardSize,
+    totalMatches,
+    totalWins,
+  ] = params.split(";")
 
   return {
-      username,
-      displayName,
-      ranking: Number(ranking),
-      status,
-      userId: Number(userId)
-  };
+    username,
+    displayName,
+    ranking: Number(ranking) || 0,
+    status,
+    userId: Number(userId),
+    isInQuickMatchQueue:
+      isInQuickMatchQueue?.trim().toLowerCase() === "true",
+    queuedBoardSize: queuedBoardSize?.trim() || "",
+    totalMatches: Number(totalMatches) || 0,
+    totalWins: Number(totalWins) || 0,
+  }
+}
+
+function parseQueuedBoardSize(value: unknown): BoardSize | null {
+  const match = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .match(/^([345])x\1$/)
+
+  return match ? Number(match[1]) as BoardSize : null
 }
 
 // Convert ranking points to rank tier
@@ -141,8 +183,8 @@ function buildUserProfile(userData: any, fallbackUsername: string): UserProfile 
     rankTier: mapRankingToTier(ranking),
     rankPoints: ranking,
     money: 50000,
-    gamesPlayed: userData?.totalMatches || 0,
-    gamesWon: userData?.totalWins || 0,
+    gamesPlayed: Number(userData?.totalMatches) || 0,
+    gamesWon: Number(userData?.totalWins) || 0,
   } as UserProfile
 }
 
@@ -460,72 +502,6 @@ function GameDecoration({ opacity = 0.12 }: { opacity?: number }) {
 
 // ─── Match History ────────────────────────────────────────────────────────────
 
-interface MatchRecord {
-  id: number
-  opponent: string
-  opponentFlag: string
-  result: "win" | "lose" | "draw"
-  scoreSelf: number
-  scoreOpponent: number
-  boardSize: BoardSize
-  date: string
-}
-
-function generateMatchHistory(user: UserProfile): MatchRecord[] {
-  let seed = 1
-  for (let i = 0; i < user.username.length; i++)
-    seed = (seed * 31 + user.username.charCodeAt(i)) % 233280
-  const rand = () => {
-    seed = (seed * 9301 + 49297) % 233280
-    return seed / 233280
-  }
-
-  const opponentPool = [...ONLINE_PLAYERS, ...OFFLINE_PLAYERS]
-  const sizes: BoardSize[] = [3, 4, 5]
-  const winRate = user.gamesPlayed > 0 ? user.gamesWon / user.gamesPlayed : 0.5
-
-  const records: MatchRecord[] = []
-  let dayOffset = 0
-  for (let i = 0; i < 20; i++) {
-    const opp = opponentPool[Math.floor(rand() * opponentPool.length)]
-    const size = sizes[Math.floor(rand() * sizes.length)]
-    const total = size * size
-    const isDraw = total % 2 === 0 && rand() < 0.08
-    const isWin = !isDraw && rand() < winRate
-
-    let scoreSelf: number, scoreOpponent: number
-    if (isDraw) {
-      scoreSelf = scoreOpponent = total / 2
-    } else if (isWin) {
-      scoreSelf =
-        Math.ceil(total / 2) + Math.floor(rand() * Math.floor(total / 2 + 1))
-      scoreSelf = Math.min(scoreSelf, total)
-      scoreOpponent = total - scoreSelf
-    } else {
-      scoreOpponent =
-        Math.ceil(total / 2) + Math.floor(rand() * Math.floor(total / 2 + 1))
-      scoreOpponent = Math.min(scoreOpponent, total)
-      scoreSelf = total - scoreOpponent
-    }
-
-    dayOffset += 1 + Math.floor(rand() * 2)
-    const d = new Date()
-    d.setDate(d.getDate() - dayOffset)
-
-    records.push({
-      id: i,
-      opponent: opp.username,
-      opponentFlag: opp.flag,
-      result: isDraw ? "draw" : scoreSelf > scoreOpponent ? "win" : "lose",
-      scoreSelf,
-      scoreOpponent,
-      boardSize: size,
-      date: d.toLocaleDateString("vi-VN"),
-    })
-  }
-  return records
-}
-
 function MatchHistoryModal({
   user,
   onClose,
@@ -533,7 +509,51 @@ function MatchHistoryModal({
   user: UserProfile
   onClose: () => void
 }) {
-  const history = generateMatchHistory(user)
+  const [history, setHistory] = useState<MatchHistoryEntry[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  // Chỉ yêu cầu lịch sử khi modal được mở.
+  useEffect(() => {
+    if (wsService.getStatus() !== "connected") {
+      setError("Không có kết nối tới server.")
+      setLoading(false)
+      return
+    }
+
+    const unsubscribe = wsService.subscribe((response) => {
+      if (
+        response?.type === "disconnected" ||
+        response?.type === "error"
+      ) {
+        setError("Mất kết nối tới server khi tải lịch sử.")
+        setLoading(false)
+        return
+      }
+
+      if (response?.type !== "message") return
+
+      const msg = splitServerMessage(response.data)
+
+      if (!msg || msg.opcode !== OP.REPLY_MATCH_HISTORY) {
+        return
+      }
+
+      const records = parseMatchHistory(msg.params)
+
+      setHistory(records)
+      setLoading(false)
+      setError(null)
+
+      console.log("[MATCH HISTORY] Received:", records)
+    })
+
+    // Đăng ký listener trước rồi mới gửi request.
+    wsService.sendMessage(msgGetMatchHistory(20))
+
+    return unsubscribe
+  }, [])
+
   const wins = history.filter((m) => m.result === "win").length
   const losses = history.filter((m) => m.result === "lose").length
   const draws = history.filter((m) => m.result === "draw").length
@@ -561,8 +581,11 @@ function MatchHistoryModal({
 
   return (
     <div
-      className="fade-in fixed inset-0 z-50 flex items-center justify-center p-4"
-      style={{ background: "rgba(0,0,0,0.75)", backdropFilter: "blur(4px)" }}
+      className="fade-in fixed inset-0 z-[60] flex items-center justify-center p-4"
+      style={{
+        background: "rgba(0,0,0,0.75)",
+        backdropFilter: "blur(4px)",
+      }}
       onClick={onClose}
     >
       <div
@@ -588,6 +611,7 @@ function MatchHistoryModal({
             >
               LỊCH SỬ ĐẤU
             </h2>
+
             <p
               className="text-xs"
               style={{
@@ -600,132 +624,148 @@ function MatchHistoryModal({
           </div>
         </div>
 
+        {/* Thống kê được tính từ dữ liệu thật */}
         <div className="grid grid-cols-3 gap-2 mb-4 flex-shrink-0">
-          <div
-            className="rounded-lg py-2.5 text-center"
-            style={{
-              background: "rgba(74,222,128,0.1)",
-              border: "1px solid rgba(74,222,128,0.25)",
-            }}
-          >
-            <p
-              className="text-xs"
+          {[
+            {
+              label: "THẮNG",
+              value: wins,
+              color: "#4ade80",
+              bg: "rgba(74,222,128,0.1)",
+              border: "rgba(74,222,128,0.25)",
+            },
+            {
+              label: "THUA",
+              value: losses,
+              color: "#f87171",
+              bg: "rgba(248,113,113,0.08)",
+              border: "rgba(248,113,113,0.25)",
+            },
+            {
+              label: "HÒA",
+              value: draws,
+              color: "#f7c04f",
+              bg: "rgba(247,192,79,0.08)",
+              border: "rgba(247,192,79,0.25)",
+            },
+          ].map((item) => (
+            <div
+              key={item.label}
+              className="rounded-lg py-2.5 text-center"
               style={{
-                color: "rgba(255,255,255,0.35)",
-                fontFamily: "var(--font-mono)",
-                fontSize: 9,
+                background: item.bg,
+                border: `1px solid ${item.border}`,
               }}
             >
-              THẮNG
-            </p>
-            <p
-              className="font-bold text-lg"
-              style={{ color: "#4ade80", fontFamily: "var(--font-display)" }}
-            >
-              {wins}
-            </p>
-          </div>
-          <div
-            className="rounded-lg py-2.5 text-center"
-            style={{
-              background: "rgba(248,113,113,0.08)",
-              border: "1px solid rgba(248,113,113,0.25)",
-            }}
-          >
-            <p
-              className="text-xs"
-              style={{
-                color: "rgba(255,255,255,0.35)",
-                fontFamily: "var(--font-mono)",
-                fontSize: 9,
-              }}
-            >
-              THUA
-            </p>
-            <p
-              className="font-bold text-lg"
-              style={{ color: "#f87171", fontFamily: "var(--font-display)" }}
-            >
-              {losses}
-            </p>
-          </div>
-          <div
-            className="rounded-lg py-2.5 text-center"
-            style={{
-              background: "rgba(247,192,79,0.08)",
-              border: "1px solid rgba(247,192,79,0.25)",
-            }}
-          >
-            <p
-              className="text-xs"
-              style={{
-                color: "rgba(255,255,255,0.35)",
-                fontFamily: "var(--font-mono)",
-                fontSize: 9,
-              }}
-            >
-              HÒA
-            </p>
-            <p
-              className="font-bold text-lg"
-              style={{ color: "#f7c04f", fontFamily: "var(--font-display)" }}
-            >
-              {draws}
-            </p>
-          </div>
-        </div>
-
-        <div className="flex-1 overflow-y-auto space-y-1.5 pr-1">
-          {history.map((m) => {
-            const meta = resultMeta[m.result]
-            return (
-              <div
-                key={m.id}
-                className="flex items-center gap-3 px-3 py-2.5 rounded-lg"
+              <p
+                className="text-xs"
                 style={{
-                  background: meta.bg,
-                  border: `1px solid ${meta.border}`,
+                  color: "rgba(255,255,255,0.35)",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 9,
                 }}
               >
-                <span
-                  className="text-xs font-bold px-2 py-1 rounded flex-shrink-0"
+                {item.label}
+              </p>
+
+              <p
+                className="font-bold text-lg"
+                style={{
+                  color: item.color,
+                  fontFamily: "var(--font-display)",
+                }}
+              >
+                {item.value}
+              </p>
+            </div>
+          ))}
+        </div>
+
+        {/* Danh sách lịch sử */}
+        <div className="flex-1 overflow-y-auto space-y-1.5 pr-1">
+          {loading ? (
+            <div className="flex flex-col items-center py-10 gap-3">
+              <div className="w-7 h-7 rounded-full border-2 border-blue-400 border-t-transparent animate-spin" />
+              <p className="text-xs text-white/40">
+                Đang tải lịch sử đấu...
+              </p>
+            </div>
+          ) : error ? (
+            <div className="text-center py-10">
+              <p className="text-3xl mb-2">⚠️</p>
+              <p className="text-sm text-red-300">{error}</p>
+            </div>
+          ) : history.length === 0 ? (
+            <div className="text-center py-10">
+              <p className="text-4xl mb-3">🎮</p>
+              <p className="text-sm text-white/60">
+                Bạn chưa có lịch sử trận đấu.
+              </p>
+            </div>
+          ) : (
+            history.map((m) => {
+              const meta = resultMeta[m.result]
+
+              const date =
+                m.time > 0
+                  ? new Date(m.time).toLocaleString("vi-VN")
+                  : "Không rõ thời gian"
+
+              return (
+                <div
+                  key={m.matchId}
+                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg"
                   style={{
-                    color: meta.color,
-                    background: `${meta.color}22`,
-                    fontFamily: "var(--font-mono)",
-                    fontSize: 9,
-                    letterSpacing: "0.05em",
+                    background: meta.bg,
+                    border: `1px solid ${meta.border}`,
                   }}
                 >
-                  {meta.label}
-                </span>
-                <div className="flex-1 min-w-0">
-                  <p
-                    className="text-xs font-medium truncate"
-                    style={{ color: "rgba(255,255,255,0.8)" }}
-                  >
-                    vs {m.opponentFlag} {m.opponent}
-                  </p>
-                  <p
-                    className="text-xs"
+                  <span
+                    className="text-xs font-bold px-2 py-1 rounded flex-shrink-0"
                     style={{
-                      color: "rgba(255,255,255,0.3)",
+                      color: meta.color,
+                      background: `${meta.color}22`,
                       fontFamily: "var(--font-mono)",
                       fontSize: 9,
+                      letterSpacing: "0.05em",
                     }}
                   >
-                    Bàn {m.boardSize}×{m.boardSize} · {m.date}
-                  </p>
+                    {meta.label}
+                  </span>
+
+                  <div className="flex-1 min-w-0">
+                    <p
+                      className="text-xs font-medium truncate"
+                      style={{ color: "rgba(255,255,255,0.8)" }}
+                    >
+                      vs 👤 {m.opponentDisplayName || m.opponentUsername}
+                    </p>
+
+                    <p
+                      className="text-xs"
+                      style={{
+                        color: "rgba(255,255,255,0.3)",
+                        fontFamily: "var(--font-mono)",
+                        fontSize: 9,
+                      }}
+                    >
+                      Bàn {m.boardSize}×{m.boardSize} · {date}
+                    </p>
+                  </div>
+
+                  <span
+                    className="text-sm font-bold flex-shrink-0"
+                    style={{
+                      color: meta.color,
+                      fontFamily: "var(--font-mono)",
+                    }}
+                  >
+                    {m.scoreSelf}–{m.scoreOpponent}
+                  </span>
                 </div>
-                <span
-                  className="text-sm font-bold flex-shrink-0"
-                  style={{ color: meta.color, fontFamily: "var(--font-mono)" }}
-                >
-                  {m.scoreSelf}–{m.scoreOpponent}
-                </span>
-              </div>
-            )
-          })}
+              )
+            })
+          )}
         </div>
       </div>
     </div>
@@ -737,13 +777,63 @@ function MatchHistoryModal({
 function PlayerPopup({
   user,
   onClose,
+  onUserUpdate,
 }: {
   user: UserProfile
   onClose: () => void
+  onUserUpdate: (updatedUser: UserProfile) => void
 }) {
   const winRate = getWinRate(user.gamesPlayed, user.gamesWon)
   const rc = rankColor(user.rankTier)
   const [showHistory, setShowHistory] = useState(false)
+  // Cập nhật thông tin hồ sơ từ Java Server mỗi khi mở popup
+  useEffect(() => {
+    if (wsService.getStatus() !== "connected") {
+      return
+    }
+
+    const unsubscribe = wsService.subscribe((response) => {
+      if (response?.type !== "message") return
+
+      const msg = splitServerMessage(response.data)
+
+      if (!msg || msg.opcode !== "RETURN_USER_DETAIL") {
+        return
+      }
+
+      try {
+        const userData = parseUserDetail(msg.params)
+
+        // Chỉ nhận dữ liệu của tài khoản đang xem
+        if (userData.username !== user.username) {
+          return
+        }
+
+        const updatedProfile = buildUserProfile(
+          userData,
+          user.username
+        )
+
+        console.log("[PROFILE] Updated user statistics:", {
+          gamesPlayed: updatedProfile.gamesPlayed,
+          gamesWon: updatedProfile.gamesWon,
+          winRate: getWinRate(
+            updatedProfile.gamesPlayed,
+            updatedProfile.gamesWon
+          ),
+        })
+
+        onUserUpdate(updatedProfile)
+      } catch (error) {
+        console.error("[PROFILE] Failed to update user details:", error)
+      }
+    })
+
+    // Gửi yêu cầu lấy thông tin tài khoản hiện tại
+    wsService.sendMessage(`GET_USER_DETAIL,,${user.username}`)
+
+    return unsubscribe
+  }, [user.username, onUserUpdate])
   return (
     <div
       className="fade-in fixed inset-0 z-40 flex items-center justify-center"
@@ -1092,6 +1182,11 @@ function SettingsModal({
   )
 }
 
+type QuickMatchRestoreInfo = {
+  isInQueue: boolean
+  boardSize: BoardSize | null
+}
+
 // ─── Auth Page ────────────────────────────────────────────────────────────────
 
 
@@ -1099,7 +1194,11 @@ function AuthPage({
   onLogin,
   wsStatus,
 }: {
-  onLogin: (u: UserProfile, serverSessionId: string | null) => void
+  onLogin: (
+    u: UserProfile,
+    serverSessionId: string | null,
+    queueInfo?: QuickMatchRestoreInfo
+  ) => void
   wsStatus: WsStatus
 }) {
   const [tab, setTab] = useState<"login" | "register">("login")
@@ -1209,13 +1308,27 @@ function AuthPage({
       }
       try {
         const userData = parseUserDetail(params)
+
         console.log("📥 Received user data from database:", userData)
+
         const userProfile = buildUserProfile(
           userData,
           pendingUsernameRef.current
         )
+
+        const queueInfo: QuickMatchRestoreInfo = {
+          isInQueue: userData.isInQuickMatchQueue === true,
+          boardSize: parseQueuedBoardSize(userData.queuedBoardSize),
+        }
+
         console.log("✅ Converted user profile:", userProfile)
-        onLoginRef.current(userProfile, serverSessionIdRef.current)
+        console.log("🎮 Restored quick match queue:", queueInfo)
+
+        onLoginRef.current(
+          userProfile,
+          serverSessionIdRef.current,
+          queueInfo
+        )
       } catch (error) {
         console.error("❌ Failed to parse user data:", error)
         show("Lỗi khi lấy dữ liệu người dùng", "error")
@@ -1611,6 +1724,7 @@ const JOIN_ERROR_TEXT: Record<string, string> = {
 
 function HomePage({
   user,
+  onUserUpdate,
   onNavigate,
   selectedSize,
   onSizeChange,
@@ -1618,8 +1732,11 @@ function HomePage({
   onLogout,
   autoSearch,
   onAutoSearchHandled,
+  resumeQuickMatch,
+  onResumeQuickMatchHandled,
 }: {
   user: UserProfile
+  onUserUpdate: (updatedUser: UserProfile) => void
   onNavigate: (p: Page) => void
   selectedSize: SizeFilter
   onSizeChange: (s: SizeFilter) => void
@@ -1627,6 +1744,8 @@ function HomePage({
   onLogout: (username: string) => void
   autoSearch: boolean
   onAutoSearchHandled: () => void
+  resumeQuickMatch: boolean
+  onResumeQuickMatchHandled: () => void
 }) {
   const [showProfile, setShowProfile] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -1640,9 +1759,13 @@ function HomePage({
   const [showRules, setShowRules] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
 
-  const [searchState, setSearchState] = useState<SearchState>("idle")
-  // Ref song song với state để callback WebSocket luôn đọc được giá trị mới nhất
-  const searchRef = useRef<SearchState>("idle")
+  const [searchState, setSearchState] = useState<SearchState>(
+    resumeQuickMatch ? "searching" : "idle"
+  )
+
+  const searchRef = useRef<SearchState>(
+    resumeQuickMatch ? "searching" : "idle"
+  )
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const autoStartedRef = useRef(false)
@@ -1665,6 +1788,13 @@ function HomePage({
     if (noticeTimer.current) clearTimeout(noticeTimer.current)
     noticeTimer.current = setTimeout(() => setNotice(null), 2800)
   }
+
+  useEffect(() => {
+    if (resumeQuickMatch) {
+      console.log("[QUICK MATCH] Restoring queue popup")
+      onResumeQuickMatchHandled()
+    }
+  }, [])
 
   // ✅ Lắng nghe phản hồi ghép trận từ server
   // (MATCH_FOUND được App xử lý để chuyển sang trang game; ở đây chỉ dọn trạng thái tìm trận)
@@ -1713,23 +1843,51 @@ function HomePage({
 
         case OP.REPLY_JOIN_QUICK_MATCH: {
           if (searchRef.current !== "joining") return
+
           clearSearchTimer()
-          const status = msg.params.trim()
+
+          // Server có thể gửi SUCCESS;3x3 hoặc SUCCESS;4x4...
+          const parts = msg.params.trim().split(";")
+          const status = parts[0].trim().toUpperCase()
+          const assignedSize = parts[1]?.trim()
+
+          console.log("[QUICK MATCH] Server response:", {
+            status,
+            assignedSize,
+          })
+
           if (status === "SUCCESS" || status === "ALREADY_IN_QUEUE") {
             updateSearch("searching")
           } else {
             updateSearch("idle")
-            showNotice(JOIN_ERROR_TEXT[status] ?? `❌ Không thể tìm trận: ${status}`)
+            showNotice(
+              JOIN_ERROR_TEXT[status] ??
+              `❌ Không thể tìm trận: ${status}`
+            )
           }
+
           break
         }
 
         case OP.REPLY_CANCEL_QUICK_MATCH: {
           if (searchRef.current !== "cancelling") return
+
           clearSearchTimer()
-          updateSearch("idle")
-          // SUCCESS: đã rời hàng đợi. NOT_IN_QUEUE: không còn trong hàng đợi (vd. vừa được ghép trận).
-          if (msg.params.trim() === "SUCCESS") showNotice("Đã hủy tìm trận")
+
+          const status = msg.params.trim().toUpperCase()
+
+          if (status === "SUCCESS") {
+            updateSearch("idle")
+            showNotice("✅ Đã hủy ghép trận thành công")
+          } else if (status === "NOT_IN_QUEUE") {
+            updateSearch("idle")
+            showNotice("Bạn hiện không còn trong hàng đợi")
+          } else {
+            // Không xác nhận hủy thành công thì vẫn giữ trạng thái tìm trận
+            updateSearch("searching")
+            showNotice(`Không thể hủy ghép trận: ${status}`)
+          }
+
           break
         }
       }
@@ -1800,13 +1958,29 @@ function HomePage({
 
   // ✅ HỦY → gửi CANCEL_QUICK_MATCH
   const handleCancelSearch = () => {
-    if (searchRef.current !== "searching" && searchRef.current !== "joining") return
+    if (
+      searchRef.current !== "searching" &&
+      searchRef.current !== "joining"
+    ) return
+
+    if (wsService.getStatus() !== "connected") {
+      showNotice("Mất kết nối tới server, chưa thể hủy ghép trận.")
+      return
+    }
+
     updateSearch("cancelling")
     wsService.sendMessage(msgCancelQuickMatch())
 
     clearSearchTimer()
+
     searchTimer.current = setTimeout(() => {
-      if (searchRef.current === "cancelling") updateSearch("idle")
+      if (searchRef.current === "cancelling") {
+        // Không tự chuyển về idle vì chưa biết server đã hủy hay chưa
+        updateSearch("searching")
+        showNotice(
+          "Server chưa phản hồi yêu cầu hủy. Mày vẫn có thể đang trong hàng đợi, hãy thử hủy lại."
+        )
+      }
     }, 5000)
   }
 
@@ -2262,6 +2436,38 @@ function HomePage({
               TẠO BÀN
             </button>
             <button
+              className="btn-ghost w-full py-3 flex items-center justify-center gap-2 text-sm"
+              onClick={() => {
+                // Nếu đang tìm trận nhanh thì hủy trước khi chuyển trang
+                if (
+                  searchRef.current === "searching" ||
+                  searchRef.current === "joining"
+                ) {
+                  clearSearchTimer()
+                  wsService.sendMessage(msgCancelQuickMatch())
+                  updateSearch("idle")
+                }
+
+                onNavigate("find-room")
+              }}
+              style={{
+                borderRadius: 12,
+              }}
+            >
+              <svg
+                width="18"
+                height="18"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth="2"
+              >
+                <rect x="3" y="5" width="18" height="14" rx="2" />
+                <path d="M7 10h10M7 14h5" />
+              </svg>
+              THAM GIA BẰNG MÃ PHÒNG
+            </button>
+            <button
               className="btn-ghost w-full py-2.5 flex items-center justify-center gap-2 text-sm"
               onClick={() => setShowRules(true)}
             >
@@ -2496,7 +2702,11 @@ function HomePage({
 
       {/* Modals */}
       {showProfile && (
-        <PlayerPopup user={user} onClose={() => setShowProfile(false)} />
+        <PlayerPopup
+          user={user}
+          onClose={() => setShowProfile(false)}
+          onUserUpdate={onUserUpdate}
+        />
       )}
       {showSettings && (
         <SettingsModal
@@ -2508,36 +2718,89 @@ function HomePage({
       {showRules && <RulesModal onClose={() => setShowRules(false)} />}
 
       {/* Matchmaking toast (đang tìm trận / hủy tìm trận) */}
+      {/* Popup tìm trận và hủy ghép trận */}
       {searching && (
         <div
-          className="toast fixed bottom-8 left-1/2 -translate-x-1/2 px-6 py-3.5 rounded-xl flex items-center gap-3 z-30"
+          className="fade-in fixed inset-0 z-[100] flex items-center justify-center p-4"
           style={{
-            background: "rgba(13,16,35,0.95)",
-            border: "1px solid rgba(79,142,247,0.4)",
-            backdropFilter: "blur(8px)",
-            boxShadow: "0 8px 32px rgba(79,142,247,0.2)",
+            background: "rgba(0,0,0,0.75)",
+            backdropFilter: "blur(6px)",
           }}
         >
-          <div className="w-4 h-4 rounded-full border-2 border-blue-400 border-t-transparent animate-spin" />
-          <span className="text-sm font-medium" style={{ color: "#4f8ef7" }}>
-            {searchState === "cancelling"
-              ? "Đang hủy tìm trận..."
-              : `🔍 Đang tìm đối thủ · Bàn ${searchLabel}...`}
-          </span>
-          {searchState !== "cancelling" && (
-            <button
-              onClick={handleCancelSearch}
-              className="ml-1 px-3 py-1 rounded-lg text-xs font-semibold transition-all hover:scale-105"
+          <div
+            className="slide-up glass rounded-2xl p-8 w-full max-w-sm text-center shadow-2xl"
+            style={{
+              border: "1px solid rgba(79,142,247,0.35)",
+              boxShadow: "0 0 40px rgba(79,142,247,0.15)",
+            }}
+          >
+            <div className="flex justify-center mb-5">
+              <div
+                className="w-16 h-16 rounded-full flex items-center justify-center"
+                style={{
+                  background: "rgba(79,142,247,0.12)",
+                  border: "1px solid rgba(79,142,247,0.3)",
+                }}
+              >
+                <div
+                  className="w-8 h-8 rounded-full border-[3px] border-blue-400 border-t-transparent animate-spin"
+                />
+              </div>
+            </div>
+
+            <h2
+              className="text-xl font-black tracking-widest mb-2"
               style={{
-                background: "rgba(247,79,94,0.15)",
-                border: "1px solid rgba(247,79,94,0.4)",
-                color: "#f74f5e",
+                fontFamily: "var(--font-display)",
+                color: "#4f8ef7",
+              }}
+            >
+              {searchState === "cancelling"
+                ? "ĐANG HỦY GHÉP TRẬN"
+                : "ĐANG TÌM ĐỐI THỦ"}
+            </h2>
+
+            <p
+              className="text-sm mb-2"
+              style={{ color: "rgba(255,255,255,0.65)" }}
+            >
+              {searchState === "joining"
+                ? "Đang gửi yêu cầu tìm trận tới server..."
+                : searchState === "cancelling"
+                  ? "Đang yêu cầu server đưa mày ra khỏi hàng đợi..."
+                  : "Đang chờ người chơi khác tham gia..."}
+            </p>
+
+            <p
+              className="text-xs mb-7"
+              style={{
+                color: "rgba(255,255,255,0.35)",
                 fontFamily: "var(--font-mono)",
               }}
             >
-              HỦY
+              Kích thước: {searchLabel}
+            </p>
+
+            <button
+              onClick={handleCancelSearch}
+              disabled={searchState === "cancelling"}
+              className="w-full py-3 rounded-xl font-bold transition-all"
+              style={{
+                background:
+                  searchState === "cancelling"
+                    ? "rgba(255,255,255,0.08)"
+                    : "rgba(247,79,94,0.16)",
+                border: "1px solid rgba(247,79,94,0.45)",
+                color: "#f74f5e",
+                cursor: searchState === "cancelling" ? "not-allowed" : "pointer",
+                opacity: searchState === "cancelling" ? 0.6 : 1,
+              }}
+            >
+              {searchState === "cancelling"
+                ? "ĐANG XỬ LÝ..."
+                : "✕ HỦY GHÉP TRẬN"}
             </button>
-          )}
+          </div>
         </div>
       )}
 
@@ -2586,7 +2849,8 @@ export default function App() {
   const [restoreSnapshot, setRestoreSnapshot] = useState<RestoreMatchMsg | null>(null)
   const restoreSnapshotRef = useRef<RestoreMatchMsg | null>(null)
   const [autoSearch, setAutoSearch] = useState(false)
-
+  // Có khôi phục người chơi đang nằm trong hàng đợi quick match hay không
+  const [resumeQuickMatch, setResumeQuickMatch] = useState(false)
   // ✅ Session của TAB hiện tại (sessionStorage): có user gắn với session → khôi phục
   const [savedSession] = useState<TabSession | null>(() => loadTabSession())
   const [restoring, setRestoring] = useState<boolean>(savedSession !== null)
@@ -2635,12 +2899,36 @@ export default function App() {
       }
       if (!USER_DATA_OPCODES.includes(opcode)) return
       try {
+        const userData = parseUserDetail(params)
+
         const profile = buildUserProfile(
-          parseUserDetail(params),
+          userData,
           savedSession.username
         )
+
+        const queueInfo: QuickMatchRestoreInfo = {
+          isInQueue: userData.isInQuickMatchQueue === true,
+          boardSize: parseQueuedBoardSize(userData.queuedBoardSize),
+        }
+
         console.log("♻️ Session restored for:", profile.username)
+        console.log("🎮 Restored quick match queue:", queueInfo)
+
         setUser(profile)
+
+        // Chỉ khôi phục popup nếu thực sự còn trong quick match queue
+        setResumeQuickMatch(queueInfo.isInQueue)
+
+        // Khôi phục luôn kích thước bàn đang tìm
+        if (queueInfo.isInQueue && queueInfo.boardSize !== null) {
+          setSelectedSize(queueInfo.boardSize)
+        }
+
+        // Nếu có trận đang chơi thì ưu tiên vào GamePage
+        if (restoreSnapshotRef.current) {
+          setResumeQuickMatch(false)
+        }
+
         setPage(restoreSnapshotRef.current ? "game" : "home")
         endRestore()
       } catch (error) {
@@ -2707,7 +2995,8 @@ export default function App() {
     return unsubscribe
   }, [])
 
-  // ✅ Server ghép được trận → MATCH_FOUND: roomId;opponentUsername;opponentDisplayName;opponentRanking;role
+  // Server gửi MATCH_FOUND:
+  // roomId;opponentUsername;opponentDisplayName;opponentRanking;role;boardSize
   // Xử lý ở cấp App để dù người chơi đang ở trang nào cũng được đưa vào trận
   useEffect(() => {
     const offMatch = wsService.subscribe((response) => {
@@ -2732,6 +3021,7 @@ export default function App() {
       setIncomingInvitation(null)
       setInvitationResponding(false)
       setInvitationError(null)
+      setResumeQuickMatch(false)
       setPage("game")
     })
     return offMatch
@@ -2759,6 +3049,7 @@ export default function App() {
       setIncomingInvitation(null)
       setInvitationResponding(false)
       setInvitationError(null)
+      setResumeQuickMatch(false)
       setPage("game")
     })
     return off
@@ -2820,7 +3111,8 @@ export default function App() {
 
   const handleLogin = (
     u: UserProfile,
-    serverSessionId: string | null
+    serverSessionId: string | null,
+    queueInfo?: QuickMatchRestoreInfo
   ) => {
     if (serverSessionId) {
       saveTabSession(u.username, serverSessionId)
@@ -2829,13 +3121,21 @@ export default function App() {
     }
 
     setUser(u)
+    // Khôi phục trạng thái hàng đợi từ dữ liệu server
+    const isInQueue = queueInfo?.isInQueue === true
 
+    setResumeQuickMatch(isInQueue)
+
+    if (isInQueue && queueInfo?.boardSize !== null && queueInfo?.boardSize !== undefined) {
+      setSelectedSize(queueInfo.boardSize)
+    }
     // Có snapshot trận đấu thì ưu tiên vào GamePage.
     // Không dùng setTimeout chuyển về Home nữa.
     if (restoreSnapshotRef.current !== null) {
       setIncomingInvitation(null)
       setInvitationResponding(false)
       setInvitationError(null)
+      setResumeQuickMatch(false)
       setPage("game")
     } else {
       setPage("home")
@@ -2860,6 +3160,7 @@ export default function App() {
     setIncomingInvitation(null)
     setInvitationResponding(false)
     setInvitationError(null)
+    setResumeQuickMatch(false)
     console.log("✅ User logged out: " + username)
   }
 
@@ -2921,6 +3222,7 @@ export default function App() {
     setActiveMatch(null)
     restoreSnapshotRef.current = null
     setRestoreSnapshot(null)
+    setResumeQuickMatch(false)
     setPage("home")
   }
 
@@ -2929,6 +3231,7 @@ export default function App() {
     setActiveMatch(null)
     restoreSnapshotRef.current = null
     setRestoreSnapshot(null)
+    setResumeQuickMatch(false)
     setAutoSearch(true)
     setPage("home")
   }
@@ -2977,9 +3280,15 @@ export default function App() {
           defaultSize={roomDefaultSize}
           onBack={() => setPage("home")}
         />
+      ) : page === "find-room" ? (
+        <FindRoomPage
+          user={user}
+          onBack={() => setPage("home")}
+        />
       ) : (
         <HomePage
           user={user}
+          onUserUpdate={setUser}
           onNavigate={setPage}
           selectedSize={selectedSize}
           onSizeChange={setSelectedSize}
@@ -2987,6 +3296,8 @@ export default function App() {
           onLogout={handleLogout}
           autoSearch={autoSearch}
           onAutoSearchHandled={() => setAutoSearch(false)}
+          resumeQuickMatch={resumeQuickMatch}
+          onResumeQuickMatchHandled={() => setResumeQuickMatch(false)}
         />
       )}
 

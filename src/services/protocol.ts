@@ -35,6 +35,8 @@ export const OP = {
 
   FIND_ROOM: "FIND_ROOM",
   REPLY_FIND_ROOM: "REPLY_FIND_ROOM",
+  GET_MATCH_HISTORY: "GET_MATCH_HISTORY",
+  REPLY_MATCH_HISTORY: "REPLY_MATCH_HISTORY",
 } as const
 
 const toInt = (value: string | undefined): number | null => {
@@ -118,6 +120,8 @@ export const msgJoinQuickMatch = (boardSize: BoardSize | "any") =>
     boardSize === "any" ? "ANY" : `${boardSize}x${boardSize}`
   )
 export const msgCancelQuickMatch = () => buildMessage(OP.CANCEL_QUICK_MATCH)
+export const msgGetMatchHistory = (limit = 20) =>
+  buildMessage(OP.GET_MATCH_HISTORY, String(limit))
 export const msgMakeMove = (r1: number, c1: number, r2: number, c2: number) =>
   buildMessage(OP.MAKE_MOVE, `${r1};${c1};${r2};${c2}`)
 export const msgSurrender = () => buildMessage(OP.SURRENDER)
@@ -187,6 +191,100 @@ export function parseLeaderboard(
   }
 
   return result
+}
+
+export interface MatchHistoryEntry {
+  matchId: number
+  opponentUsername: string
+  opponentDisplayName: string
+  result: "win" | "lose" | "draw"
+  scoreSelf: number
+  scoreOpponent: number
+  boardSize: BoardSize
+  time: number
+}
+
+function decodeHistoryText(value: string): string {
+  try {
+    // Java dùng Base64 URL-safe không padding.
+    let base64 = value.replace(/-/g, "+").replace(/_/g, "/")
+
+    while (base64.length % 4 !== 0) {
+      base64 += "="
+    }
+
+    const binary = atob(base64)
+    const bytes = Uint8Array.from(
+      binary,
+      (char) => char.charCodeAt(0)
+    )
+
+    return new TextDecoder("utf-8").decode(bytes)
+  } catch {
+    return ""
+  }
+}
+
+export function parseMatchHistory(
+  params: string
+): MatchHistoryEntry[] {
+  if (!params.trim()) return []
+
+  const history: MatchHistoryEntry[] = []
+
+  for (const row of params.split("|")) {
+    const fields = row.split(";")
+
+    if (fields.length !== 8) continue
+
+    const [
+      matchIdText,
+      usernameEncoded,
+      displayNameEncoded,
+      resultText,
+      selfScoreText,
+      opponentScoreText,
+      boardSizeText,
+      timeText,
+    ] = fields
+
+    const matchId = toInt(matchIdText)
+    const scoreSelf = toInt(selfScoreText)
+    const scoreOpponent = toInt(opponentScoreText)
+    const time = Number(timeText)
+
+    const result = resultText.trim().toLowerCase()
+    const sizeMatch = boardSizeText.trim().match(/^([345])x\1$/i)
+
+    const boardSize = sizeMatch
+      ? Number(sizeMatch[1]) as BoardSize
+      : null
+
+    if (
+      matchId === null ||
+      scoreSelf === null ||
+      scoreOpponent === null ||
+      !Number.isSafeInteger(time) ||
+      time < 0 ||
+      !["win", "lose", "draw"].includes(result) ||
+      boardSize === null
+    ) {
+      continue
+    }
+
+    history.push({
+      matchId,
+      opponentUsername: decodeHistoryText(usernameEncoded),
+      opponentDisplayName: decodeHistoryText(displayNameEncoded),
+      result: result as "win" | "lose" | "draw",
+      scoreSelf,
+      scoreOpponent,
+      boardSize,
+      time,
+    })
+  }
+
+  return history
 }
 
 export type ServerUserStatus =
